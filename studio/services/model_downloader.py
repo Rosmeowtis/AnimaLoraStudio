@@ -27,6 +27,7 @@ from typing import Any, Callable, Optional
 from .. import secrets
 from ..event_bus import bus
 from ..paths import REPO_ROOT
+from .onnx_tagger_base import safe_dir_name
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +310,7 @@ def build_catalog(root: Optional[Path] = None) -> dict[str, Any]:
     qwen_d = qwen_dir(r)
     t5_d = t5_tokenizer_dir(r)
     cl_cfg = secrets.load().cltagger
-    cl_root = r / "cltagger" / cl_cfg.model_id.replace("/", "_").replace("\\", "_")
+    cl_root = r / "cltagger" / safe_dir_name(cl_cfg.model_id)
 
     return {
         "models_root": str(r),
@@ -497,7 +498,7 @@ def trigger(model_id: str, variant: Optional[str] = None) -> str:
     if model_id == "cltagger":
         cfg = secrets.load().cltagger
         key = "cltagger"
-        target = root / "cltagger" / cfg.model_id.replace("/", "_").replace("\\", "_")
+        target = root / "cltagger" / safe_dir_name(cfg.model_id)
         start_download_async(
             key, lambda log: download_cltagger(target, cfg, on_log=log)
         )

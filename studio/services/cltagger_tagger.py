@@ -5,20 +5,17 @@ CLTagger 使用 `tag_mapping.json`，输出 logits 需 sigmoid，角色标签有
 """
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Optional
 
 import numpy as np
 from PIL import Image, ImageOps
 
 from .. import secrets
-from . import model_downloader, onnxruntime_setup
-from .tagger import ProgressFn, TagResult
-from .wd14_tagger import _safe_dir_name, _silenced_fd_stderr
+from . import model_downloader
+from .onnx_tagger_base import OnnxTaggerBase, safe_dir_name
 
 logger = logging.getLogger(__name__)
 
@@ -29,16 +26,13 @@ class _LabelData:
     categories: list[str]
 
 
-class CLTagger:
+class CLTagger(OnnxTaggerBase):
     name = "cltagger"
-    requires_service = False
 
     def __init__(self, overrides: dict | None = None) -> None:
+        super().__init__()
         self._overrides = {k: v for k, v in (overrides or {}).items() if v is not None}
-        self._session = None
         self._labels: _LabelData | None = None
-        self._input_name: str | None = None
-        self._output_names: list[str] | None = None
         self._input_size: int = 448
         self._input_layout: str = "nchw"
 
@@ -49,13 +43,18 @@ class CLTagger:
                 base[k] = v
         return secrets.CLTaggerConfig(**base)
 
+    def _get_batch_size_cfg(self) -> int:
+        return int(self._cfg().batch_size or 1)
+
+    def _compute_base(self) -> Path:
+        cfg = self._cfg()
+        if cfg.local_dir:
+            return Path(cfg.local_dir)
+        return model_downloader.models_root() / "cltagger" / safe_dir_name(cfg.model_id)
+
     def _local_model_files_status(self) -> tuple[Path, Path, bool]:
         cfg = self._cfg()
-        base = (
-            Path(cfg.local_dir)
-            if cfg.local_dir
-            else model_downloader.models_root() / "cltagger" / _safe_dir_name(cfg.model_id)
-        )
+        base = self._compute_base()
         model_path = base / cfg.model_path
         mapping_path = base / cfg.tag_mapping_path
         if model_path.exists() and mapping_path.exists():
@@ -77,12 +76,15 @@ class CLTagger:
                 "local_dir 缺少 CLTagger 模型文件或 tag_mapping.json: "
                 f"{model_path} / {mapping_path}"
             )
-        base = model_path.parents[len(Path(cfg.model_path).parts) - 1]
-        model_downloader.download_cltagger(base, cfg, on_log=logger.info)
-        if not model_path.exists() or not mapping_path.exists():
+        model_downloader.download_cltagger(self._compute_base(), cfg, on_log=logger.info)
+        missing: list[str] = []
+        if not model_path.exists():
+            missing.append(f"model: {model_path}")
+        if not mapping_path.exists():
+            missing.append(f"mapping: {mapping_path}")
+        if missing:
             raise FileNotFoundError(
-                "CLTagger 下载后仍缺少模型文件或 tag_mapping.json: "
-                f"{model_path} / {mapping_path}"
+                f"CLTagger 下载后仍缺少 {', '.join(missing)}（请到设置→模型管理查看下载日志）"
             )
         return model_path, mapping_path
 
@@ -103,35 +105,10 @@ class CLTagger:
     def prepare(self) -> None:
         if self._session is not None:
             return
-        try:
-            import onnxruntime as ort
-        except ImportError as exc:  # pragma: no cover - install hint
-            raise RuntimeError(
-                "未安装 onnxruntime；请安装 onnxruntime 或 onnxruntime-gpu"
-            ) from exc
-
         model_path, mapping_path = self._resolve_model_files()
-        providers = ["CPUExecutionProvider"]
-        avail = ort.get_available_providers()
-        if "CUDAExecutionProvider" in avail:
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-        cuda_attempt = "CUDAExecutionProvider" in providers
-        ctx = _silenced_fd_stderr() if cuda_attempt else contextlib.nullcontext()
-        try:
-            with ctx:
-                self._session = ort.InferenceSession(str(model_path), providers=providers)
-        except Exception as exc:  # noqa: BLE001
-            if not cuda_attempt:
-                raise
-            err = str(exc)
-            logger.warning("CLTagger CUDA session 创建失败，降级 CPU 重试: %s", err)
-            onnxruntime_setup.record_cuda_load_error(err)
-            self._session = ort.InferenceSession(
-                str(model_path), providers=["CPUExecutionProvider"]
-            )
+        self._create_session(model_path)
+        assert self._session is not None
         input_meta = self._session.get_inputs()[0]
-        self._input_name = input_meta.name
-        self._output_names = [o.name for o in self._session.get_outputs()]
         self._input_layout = self._infer_input_layout(input_meta.shape)
         self._input_size = self._infer_input_size(input_meta.shape, self._input_layout)
         self._labels = self._load_tag_mapping(mapping_path)
@@ -216,6 +193,7 @@ class CLTagger:
 
     @staticmethod
     def _sigmoid(x: np.ndarray) -> np.ndarray:
+        # clip ±30 同时吞 ±inf：sigmoid(±30) ≈ 1/0，超界本来也要饱和
         return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
 
     def _postprocess_one(
@@ -243,72 +221,3 @@ class CLTagger:
                 out.append((tag.replace("_", " "), p_f))
         out.sort(key=lambda x: -x[1])
         return [t for t, _ in out], dict(out)
-
-    def _effective_batch_size(self) -> int:
-        cfg = self._cfg()
-        n = max(1, int(cfg.batch_size or 1))
-        if self._session is not None:
-            providers = list(self._session.get_providers())
-            if "CUDAExecutionProvider" not in providers:
-                return 1
-        return n
-
-    def _preprocess_one_safe(
-        self, indexed: tuple[int, Path]
-    ) -> tuple[int, Optional[np.ndarray], Optional[str]]:
-        j, p = indexed
-        try:
-            with Image.open(p) as raw:
-                return j, self._preprocess(raw), None
-        except Exception as exc:  # noqa: BLE001
-            return j, None, str(exc)
-
-    def tag(
-        self,
-        image_paths: list[Path],
-        on_progress: ProgressFn = lambda d, t: None,
-    ) -> Iterator[TagResult]:
-        if self._session is None:
-            self.prepare()
-        assert self._session is not None
-        assert self._input_name is not None
-        total = len(image_paths)
-        batch_n = self._effective_batch_size()
-        done = 0
-        i = 0
-        while i < total:
-            chunk = image_paths[i : i + batch_n]
-            arrs: list[np.ndarray] = []
-            ok_idx: list[int] = []
-            errs: dict[int, str] = {}
-            for j, p in enumerate(chunk):
-                j, arr, err = self._preprocess_one_safe((j, p))
-                if err is None and arr is not None:
-                    arrs.append(arr)
-                    ok_idx.append(j)
-                else:
-                    errs[j] = err or "preprocess failed"
-            logits_batch: Optional[np.ndarray] = None
-            if arrs:
-                try:
-                    batch = np.stack(arrs, axis=0).copy()
-                    outputs = self._session.run(self._output_names, {self._input_name: batch})
-                    logits_batch = np.nan_to_num(
-                        outputs[0], nan=0.0, posinf=1.0, neginf=0.0
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    for j in ok_idx:
-                        errs[j] = f"inference failed: {exc}"
-            ok_pos = 0
-            for j, p in enumerate(chunk):
-                if j in errs:
-                    yield {"image": p, "tags": [], "error": errs[j]}
-                elif logits_batch is not None and ok_pos < logits_batch.shape[0]:
-                    tags, raw_scores = self._postprocess_one(logits_batch[ok_pos])
-                    ok_pos += 1
-                    yield {"image": p, "tags": tags, "raw_scores": raw_scores}
-                else:
-                    yield {"image": p, "tags": [], "error": "no logits"}
-                done += 1
-                on_progress(done, total)
-            i += batch_n
