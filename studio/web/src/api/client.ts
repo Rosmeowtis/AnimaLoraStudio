@@ -75,6 +75,11 @@ export interface DownloadGlobalConfig {
 
 export interface HuggingFaceConfig {
   token: string
+  /** PR-S3 — HF 模型下载端点 endpoint。
+   *  `""` → huggingface_hub 默认（直连 huggingface.co）；海外用户推荐
+   *  `"https://hf-mirror.com"` → 国内默认（项目主战场国内）
+   *  其它 URL → 自定义反代 / 自建镜像 */
+  endpoint: string
 }
 
 export interface JoyCaptionConfig {

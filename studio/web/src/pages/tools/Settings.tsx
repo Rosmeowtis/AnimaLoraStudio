@@ -66,7 +66,7 @@ const EMPTY: Secrets = {
     api_rate_per_sec: 2,
     cdn_rate_per_sec: 5,
   },
-  huggingface: { token: '' },
+  huggingface: { token: '', endpoint: 'https://hf-mirror.com' },
   joycaption: {
     base_url: 'http://localhost:8000/v1',
     model: 'fancyfeast/llama-joycaption-beta-one-hf-llava',
@@ -499,6 +499,13 @@ export default function SettingsPage() {
         <p className="text-xs text-fg-tertiary px-1">
           用于 HF 私有 repo 鉴权；公开仓库（含 SmilingWolf WD14 / cella110n CLTagger）不用填。
         </p>
+
+        <SettingsField label="endpoint" desc="模型下载端点。国内推荐 hf-mirror，海外推荐官方源">
+          <HFEndpointSelect
+            value={draft.huggingface.endpoint}
+            onChange={(v) => update('huggingface', 'endpoint', v)}
+          />
+        </SettingsField>
       </SettingsSection>
 
       <SettingsSection title="队列调度">
@@ -584,6 +591,62 @@ function SensitiveInput({ value, serverValue, onChange }: {
       placeholder={serverValue === MASK ? '已保存（不显示），输入新值才覆盖' : ''}
       onChange={(e) => onChange(e.target.value || MASK)}
       className={textInputClass}                />
+  )
+}
+
+// ── HFEndpointSelect ────────────────────────────────────────────────────────
+//
+// HF 模型下载 endpoint 选择器：3 个 preset + 自定义 URL 输入。
+// 默认 hf-mirror.com（项目主战场国内）；海外用户切到 huggingface.co；
+// 也支持粘贴自定义 URL（自建反代 / sjtug / 腾讯镜像等）。
+
+const HF_ENDPOINT_PRESETS: { value: string; label: string; hint: string }[] = [
+  { value: 'https://hf-mirror.com', label: 'hf-mirror.com', hint: '国内推荐（社区维护反代）' },
+  { value: '', label: 'huggingface.co', hint: '官方源；海外推荐' },
+  { value: '__custom__', label: '自定义 URL...', hint: '粘贴自建反代 / sjtug / 腾讯等' },
+]
+
+function HFEndpointSelect({ value, onChange }: {
+  value: string; onChange: (v: string) => void
+}) {
+  const isPreset = HF_ENDPOINT_PRESETS.some(p => p.value !== '__custom__' && p.value === value)
+  const [mode, setMode] = useState<'preset' | 'custom'>(isPreset ? 'preset' : 'custom')
+  const selectedPreset = isPreset
+    ? value
+    : (mode === 'custom' ? '__custom__' : 'https://hf-mirror.com')
+
+  return (
+    <div className="flex flex-col gap-1.5">
+      <select
+        value={selectedPreset}
+        onChange={(e) => {
+          const v = e.target.value
+          if (v === '__custom__') {
+            setMode('custom')
+            // 不清当前值，让用户在下方输入
+          } else {
+            setMode('preset')
+            onChange(v)
+          }
+        }}
+        className={`${textInputClass} max-w-md`}
+      >
+        {HF_ENDPOINT_PRESETS.map(p => (
+          <option key={p.value} value={p.value}>
+            {p.label}{p.hint ? ` — ${p.hint}` : ''}
+          </option>
+        ))}
+      </select>
+      {mode === 'custom' && (
+        <input
+          type="text"
+          value={value && !isPreset ? value : ''}
+          placeholder="https://your-mirror.example.com"
+          onChange={(e) => onChange(e.target.value.trim())}
+          className={`${textInputClass} max-w-md`}
+        />
+      )}
+    </div>
   )
 }
 

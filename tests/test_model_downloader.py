@@ -1,7 +1,5 @@
 """PR-6 — model_downloader._on_log per-line print。
-
-验证 download 后台 thread 里调 on_log 时，日志既进 UI ring buffer，也回显到
-backend stdout（让 studio_*.log / 终端能完整 grep）。
+PR-S3 — _resolve_endpoint env > secrets > None 优先级。
 """
 from __future__ import annotations
 
@@ -61,6 +59,84 @@ def test_on_log_writes_to_ring_buffer_and_stdout(
     out = capfd.readouterr().out
     for line in lines_to_emit:
         assert line in out
+
+
+# ---------------------------------------------------------------------------
+# PR-S3 — _resolve_endpoint
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_endpoint_prefers_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """HF_ENDPOINT 环境变量优先于 secrets。"""
+    monkeypatch.setenv("HF_ENDPOINT", "https://my-mirror.example/")
+    # secrets 读到不同值，但应被 env 覆盖
+    from studio import secrets
+    monkeypatch.setattr(
+        secrets, "load",
+        lambda: secrets.Secrets(huggingface=secrets.HuggingFaceConfig(
+            token="", endpoint="https://hf-mirror.com",
+        )),
+    )
+    assert model_downloader._resolve_endpoint() == "https://my-mirror.example/"
+
+
+def test_resolve_endpoint_falls_back_to_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """无 env 时读 secrets.huggingface.endpoint。"""
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    from studio import secrets
+    monkeypatch.setattr(
+        secrets, "load",
+        lambda: secrets.Secrets(huggingface=secrets.HuggingFaceConfig(
+            token="", endpoint="https://hf-mirror.com",
+        )),
+    )
+    assert model_downloader._resolve_endpoint() == "https://hf-mirror.com"
+
+
+def test_resolve_endpoint_returns_none_for_empty_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """secrets.huggingface.endpoint='' → None（让 huggingface_hub 用默认 huggingface.co）。"""
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    from studio import secrets
+    monkeypatch.setattr(
+        secrets, "load",
+        lambda: secrets.Secrets(huggingface=secrets.HuggingFaceConfig(
+            token="", endpoint="",
+        )),
+    )
+    assert model_downloader._resolve_endpoint() is None
+
+
+def test_resolve_endpoint_handles_corrupt_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """secrets.load() 抛异常 → 静默回退 None，不阻断下载。"""
+    monkeypatch.delenv("HF_ENDPOINT", raising=False)
+    from studio import secrets
+
+    def boom():
+        raise RuntimeError("simulated corrupt secrets")
+
+    monkeypatch.setattr(secrets, "load", boom)
+    assert model_downloader._resolve_endpoint() is None
+
+
+def test_resolve_endpoint_env_with_whitespace_treated_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """HF_ENDPOINT='  ' (空白) 视作未设；走 secrets 路径。"""
+    monkeypatch.setenv("HF_ENDPOINT", "   ")
+    from studio import secrets
+    monkeypatch.setattr(
+        secrets, "load",
+        lambda: secrets.Secrets(huggingface=secrets.HuggingFaceConfig(
+            token="", endpoint="https://hf-mirror.com",
+        )),
+    )
+    assert model_downloader._resolve_endpoint() == "https://hf-mirror.com"
 
 
 def test_on_log_does_not_hold_lock_during_print(

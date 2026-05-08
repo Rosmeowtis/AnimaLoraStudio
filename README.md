@@ -92,7 +92,9 @@ python -m studio test         # pytest + vitest
 
 ### 2. 在 Studio 里下载模型
 
-打开后先去 **设置（Settings）→ Models**，点按钮一键下载训练所需的全部权重 + tokenizer（默认走 hf-mirror.com，国内可直接拉；可在页面里切官方源、改根目录、看实时进度）。
+打开后先去 **设置（Settings）→ Models**，点按钮一键下载训练所需的全部权重 + tokenizer。
+
+下载源默认走 `hf-mirror.com`（国内反代，社区维护）—— 国内用户开箱即用。海外用户去 **Settings → 训练 → HuggingFace → endpoint** 切换到 `huggingface.co` 官方源（更快直连），或粘贴自建反代 URL。CLI 用户可以在 `python tools/download_models.py` 加 `--no-mirror` / `--endpoint URL` 显式覆盖。
 
 下载内容（默认落到 `./models/`）：
 
