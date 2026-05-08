@@ -479,6 +479,16 @@ def load_anima_model(transformer_path, device, dtype, repo_root):
     )
     Anima = anima_modeling.Anima
 
+    # flash_attn 加速：模型类加载完后 try-enable。set_flash_attn_enabled 内部
+    # 检查 _FLASH_ATTN_AVAILABLE，未装时返回 False 不抛错，安全 idempotent。
+    fn = getattr(cosmos_modeling, "set_flash_attn_enabled", None)
+    if fn is not None:
+        try:
+            if fn(True):
+                logger.info("flash_attn 启用（训练 + sample 走 fast path）")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("flash_attn 启用失败，继续走 SDPA fallback: %s", exc)
+
     # 从 checkpoint 推断配置
     with safe_open(transformer_path, framework="pt", device="cpu") as f:
         for k in f.keys():

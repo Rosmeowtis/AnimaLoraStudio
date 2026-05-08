@@ -293,6 +293,35 @@ def _spawn_browser_opener(url: str, *, delay: float = 1.0) -> None:
     t.start()
 
 
+def _try_enable_flash_attn() -> None:
+    """启动期检查 flash_attn 是否装好；装好就开 cosmos / anima 状态机。
+
+    没装就 silently skip（_check_torch_cuda 不重复提示，flash_attn 是 nice-to-have）。
+    动态 import 避免拖慢 cli import 时间（cosmos_predict2_modeling 加载触发 torch import）。
+    """
+    try:
+        from studio.services import flash_attention_setup  # noqa: PLC0415
+        if not flash_attention_setup.current_status()["installed"]:
+            return
+        from models.cosmos_predict2_modeling import set_flash_attn_enabled  # noqa: PLC0415
+        if set_flash_attn_enabled(True):
+            print("[studio] flash_attn 启用")
+        else:
+            # 装了 flash_attn 但 set_flash_attn_enabled 拒绝（_FLASH_ATTN_AVAILABLE=False）
+            # 通常意味着 import 时挂了（CUDA 版本不匹配等）；不噪声只 stderr 警告
+            print(
+                "[studio] 警告：flash_attn 已安装但模型层 import 失败，"
+                "继续走 SDPA fallback",
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001
+        # Studio 启动不能为这一项加速 fail；记 warn 但放行
+        print(
+            f"[studio] 警告：flash_attn 启用时异常（{exc}），跳过加速",
+            file=sys.stderr,
+        )
+
+
 def _check_torch_cuda() -> None:
     """启动期检查 torch 是否能用 CUDA；CPU-only torch 跑训练 / 出图会极慢。
 
@@ -482,6 +511,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             if rc != 0:
                 return rc
     _check_torch_cuda()
+    _try_enable_flash_attn()
     _bootstrap_onnxruntime()
     url = f"http://{args.host}:{args.port}/studio/"
     print(f"[studio] 启动后端 → {url}")
@@ -504,6 +534,7 @@ def cmd_dev(args: argparse.Namespace) -> int:
     if rc != 0:
         return rc
     _check_torch_cuda()
+    _try_enable_flash_attn()
     _bootstrap_onnxruntime()
 
     pg = ProcGroup()
