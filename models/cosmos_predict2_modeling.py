@@ -56,10 +56,11 @@ def set_flash_attn_enabled(enabled: bool) -> bool:
 _FLASH_FALLBACK_WARNED: set[str] = set()
 
 
-def _warn_flash_fallback(stage: str, shape: tuple, reason: str) -> None:
+def warn_flash_fallback(stage: str, shape: tuple, reason: str) -> None:
     """flash_attn fast path 失败时记 warn-once（替代 PR #17 的 except: pass 静默吞错）。
 
     key 包含 stage + shape，让用户能区分是哪个层 / 哪种 batch 在 fallback。
+    跨模块使用（anima_modeling 也调），所以是 public API 不带下划线。
     """
     key = f"{stage}:{shape}"
     if key in _FLASH_FALLBACK_WARNED:
@@ -71,6 +72,30 @@ def _warn_flash_fallback(stage: str, shape: tuple, reason: str) -> None:
         shape,
         reason,
     )
+
+
+def try_flash_attn(
+    q_BSHD: torch.Tensor,
+    k_BSHD: torch.Tensor,
+    v_BSHD: torch.Tensor,
+    stage: str,
+):
+    """统一 flash_attn 调用路径：尝试 fast path，失败时 warn-once 并让调用方走 fallback。
+
+    返回 `(out, used)`：
+    - `used=True`：flash_attn 成功，`out` 是 [B, S, H, D] 形状的输出，调用方可能要 rearrange / o_proj
+    - `used=False`：未启用 / 未装 / 失败，调用方应自己跑 SDPA fallback
+
+    所有调用点共享同一份状态读取（`_USE_FLASH_ATTN` / `_flash_attn_func`），消除
+    跨模块 lazy import（anima_modeling 之前要 `from cosmos_predict2_modeling import
+    _USE_FLASH_ATTN` 每 forward 一次）。
+    """
+    if _USE_FLASH_ATTN and _flash_attn_func is not None:
+        try:
+            return _flash_attn_func(q_BSHD, k_BSHD, v_BSHD), True
+        except Exception as exc:  # noqa: BLE001
+            warn_flash_fallback(stage, tuple(q_BSHD.shape), str(exc))
+    return None, False
 
 
 def _rotate_half(x: torch.Tensor, interleaved: bool) -> torch.Tensor:
@@ -340,13 +365,10 @@ def torch_attention_op(q_B_S_H_D: torch.Tensor, k_B_S_H_D: torch.Tensor, v_B_S_H
     Returns:
         Attention output tensor with shape (batch, seq_len, n_heads * head_dim)
     """
-    # flash_attn fast path：输入已是 bshd 格式，无需 transpose；只在 enable 时尝试。
-    if _USE_FLASH_ATTN and _flash_attn_func is not None:
-        try:
-            out = _flash_attn_func(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D)
-            return rearrange(out, "b s h d -> b s (h d)")
-        except Exception as exc:  # noqa: BLE001
-            _warn_flash_fallback("torch_attention_op", tuple(q_B_S_H_D.shape), str(exc))
+    # flash_attn fast path：输入已是 bshd 格式，无需 transpose；helper 处理状态判断 + warn-once。
+    out, used = try_flash_attn(q_B_S_H_D, k_B_S_H_D, v_B_S_H_D, "torch_attention_op")
+    if used:
+        return rearrange(out, "b s h d -> b s (h d)")
 
     in_q_shape = q_B_S_H_D.shape
     in_k_shape = k_B_S_H_D.shape

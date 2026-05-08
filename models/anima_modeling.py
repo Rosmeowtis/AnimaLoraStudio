@@ -7,19 +7,9 @@ import torch.nn.functional as F
 
 from models.cosmos_predict2_modeling import (
     MiniTrainDIT,
-    _warn_flash_fallback,
     set_flash_attn_enabled,  # noqa: F401  re-export for callers that import via this module
+    try_flash_attn,
 )
-
-# Flash attn 状态机由 cosmos_predict2_modeling 持有；这里只引用，不复制状态。
-try:
-    from models.cosmos_predict2_modeling import (  # type: ignore[import-not-found]
-        _FLASH_ATTN_AVAILABLE,
-        _flash_attn_func,
-    )
-except ImportError:
-    _FLASH_ATTN_AVAILABLE = False
-    _flash_attn_func = None
 
 
 def rotate_half(x):
@@ -96,22 +86,16 @@ class LLMAdapterAttention(nn.Module):
             key_states = apply_rotary_pos_emb(key_states, cos, sin)
 
         # flash_attn 不支持任意 mask；只在 mask=None（cross-attention 默认情形）时尝试。
-        # 状态机在 cosmos_predict2_modeling，本模块每次读最新 _USE_FLASH_ATTN（可能在
-        # set_flash_attn_enabled 后被改写）。
-        if _flash_attn_func is not None and mask is None:
-            from models.cosmos_predict2_modeling import _USE_FLASH_ATTN  # noqa: PLC0415
-            if _USE_FLASH_ATTN:
-                try:
-                    out = _flash_attn_func(
-                        query_states.transpose(1, 2),
-                        key_states.transpose(1, 2),
-                        value_states.transpose(1, 2),
-                    )
-                    return self.o_proj(out.reshape(*input_shape, -1).contiguous())
-                except Exception as exc:  # noqa: BLE001
-                    _warn_flash_fallback(
-                        "LLMAdapterAttention", tuple(query_states.shape), str(exc)
-                    )
+        # 状态判断 + warn-once 由 try_flash_attn 统一处理。
+        if mask is None:
+            out, used = try_flash_attn(
+                query_states.transpose(1, 2),
+                key_states.transpose(1, 2),
+                value_states.transpose(1, 2),
+                "LLMAdapterAttention",
+            )
+            if used:
+                return self.o_proj(out.reshape(*input_shape, -1).contiguous())
 
         attn_output = F.scaled_dot_product_attention(query_states, key_states, value_states, attn_mask=mask)
 

@@ -136,8 +136,51 @@ def test_warn_flash_fallback_keys_by_shape(
     """不同 shape 各 warn 一次。"""
     cosmos_module._FLASH_FALLBACK_WARNED.clear()
     with caplog.at_level(logging.WARNING, logger="models.cosmos_predict2_modeling"):
-        cosmos_module._warn_flash_fallback("op_a", (1, 4, 2, 8), "reason")
-        cosmos_module._warn_flash_fallback("op_a", (1, 4, 2, 8), "reason")  # 同 shape 同 stage
-        cosmos_module._warn_flash_fallback("op_a", (2, 4, 2, 8), "reason")  # 不同 shape
-        cosmos_module._warn_flash_fallback("op_b", (1, 4, 2, 8), "reason")  # 不同 stage
+        cosmos_module.warn_flash_fallback("op_a", (1, 4, 2, 8), "reason")
+        cosmos_module.warn_flash_fallback("op_a", (1, 4, 2, 8), "reason")  # 同 shape 同 stage
+        cosmos_module.warn_flash_fallback("op_a", (2, 4, 2, 8), "reason")  # 不同 shape
+        cosmos_module.warn_flash_fallback("op_b", (1, 4, 2, 8), "reason")  # 不同 stage
     assert len([r for r in caplog.records if "flash_attn fallback" in r.message]) == 3
+
+
+def test_try_flash_attn_returns_used_false_when_disabled(cosmos_module) -> None:
+    """helper 在 disabled 时返回 (None, False)，调用方走 fallback。"""
+    cosmos_module._FLASH_ATTN_AVAILABLE = True
+    cosmos_module._flash_attn_func = lambda q, k, v: q
+    cosmos_module._USE_FLASH_ATTN = False
+    q = torch.randn(1, 4, 2, 8)
+    out, used = cosmos_module.try_flash_attn(q, q, q, "test")
+    assert out is None
+    assert used is False
+
+
+def test_try_flash_attn_returns_used_true_when_enabled(cosmos_module) -> None:
+    """helper 启用且 callable 成功时返回 (out, True)。"""
+    expected = torch.zeros(1, 4, 2, 8)
+    cosmos_module._FLASH_ATTN_AVAILABLE = True
+    cosmos_module._flash_attn_func = lambda q, k, v: expected
+    cosmos_module._USE_FLASH_ATTN = True
+    q = torch.randn(1, 4, 2, 8)
+    out, used = cosmos_module.try_flash_attn(q, q, q, "test")
+    assert out is expected
+    assert used is True
+
+
+def test_try_flash_attn_returns_used_false_on_exception(
+    cosmos_module, caplog: pytest.LogCaptureFixture
+) -> None:
+    """helper 在 fast path 抛异常时 warn-once 并返回 (None, False)。"""
+    cosmos_module._FLASH_FALLBACK_WARNED.clear()
+    cosmos_module._FLASH_ATTN_AVAILABLE = True
+
+    def boom(*_a):
+        raise RuntimeError("fake")
+    cosmos_module._flash_attn_func = boom
+    cosmos_module._USE_FLASH_ATTN = True
+
+    q = torch.randn(1, 4, 2, 8)
+    with caplog.at_level(logging.WARNING, logger="models.cosmos_predict2_modeling"):
+        out, used = cosmos_module.try_flash_attn(q, q, q, "test_stage")
+    assert out is None
+    assert used is False
+    assert any("test_stage" in r.message and "fake" in r.message for r in caplog.records)
