@@ -60,6 +60,7 @@ from .services import (
     model_downloader,
     flash_attention_setup,
     onnxruntime_setup,
+    pending_install,
     torch_setup,
     reg_builder,
     tagedit,
@@ -1205,16 +1206,26 @@ class TorchReinstallRequest(BaseModel):
 
 @app.post("/api/torch/reinstall")
 def torch_reinstall(body: TorchReinstallRequest) -> dict[str, Any]:
-    """卸装 torch + torchvision 后按 target 重装；同步 pip，可能 5-30 分钟。
+    """注册 torch 重装请求；下次 Studio 启动时由 launcher 进程执行。
 
-    UI 按钮必须带 loading；torch 是 C extension，装完必须重启 Studio。
+    为什么不直接装：server 进程已 import 了 torch（flash_attention_setup 等间接拉
+    上的），Windows 上 `torch\\_C.cp311-win_amd64.pyd` 被锁，pip uninstall / replace
+    会撞 [WinError 5] 拒绝访问。改成写 marker → 用户 Ctrl+C 重启 → cli.py 启动
+    时还没 import torch，pip 能正常替换文件。
+
+    返回 `{pending: true, target, tag, message}`，UI 显示「请关闭并重启 Studio」。
     """
     try:
-        return torch_setup.reinstall(body.target)
+        tag = torch_setup._decide_target_tag(body.target)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(500, str(exc)) from exc
+    pending_install.register_torch_reinstall(body.target)
+    return {
+        "pending": True,
+        "target": body.target,
+        "tag": tag,
+        "message": "重装请求已注册。请 Ctrl+C 关闭 Studio 后重新运行 studio.bat / studio.sh —— 启动时会自动安装 torch（~3 GB，5-30 分钟），然后正常起 server。",
+    }
 
 
 # FlashAttention runtime（PR-7b）-----------------------------------------

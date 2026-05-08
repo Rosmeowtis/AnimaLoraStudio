@@ -214,6 +214,61 @@ def test_reinstall_pip_failure_raises(monkeypatch: pytest.MonkeyPatch) -> None:
         ts.reinstall("cu128")
 
 
+def test_cleanup_zombie_dirs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    """site-packages 里 `~*` 目录 + 文件应被清；正常包不动。"""
+    fake_site = tmp_path / "site-packages"
+    fake_site.mkdir()
+    # 僵尸：~orch dir + ~orchvision dir + ~stray file
+    (fake_site / "~orch-2.11.0.dist-info").mkdir()
+    (fake_site / "~orch-2.11.0.dist-info" / "METADATA").write_text("fake")
+    (fake_site / "~orchvision").mkdir()
+    (fake_site / "~stray.txt").write_text("zombie file")
+    # 正常包（不应动）
+    (fake_site / "torch").mkdir()
+    (fake_site / "torch" / "__init__.py").write_text("")
+    (fake_site / "numpy").mkdir()
+
+    monkeypatch.setattr(ts.sysconfig, "get_path", lambda _key: str(fake_site))
+    cleaned = ts._cleanup_zombie_dirs()
+    assert sorted(cleaned) == ["~orch-2.11.0.dist-info", "~orchvision", "~stray.txt"]
+    assert not (fake_site / "~orch-2.11.0.dist-info").exists()
+    assert not (fake_site / "~orchvision").exists()
+    assert not (fake_site / "~stray.txt").exists()
+    # 正常包没动
+    assert (fake_site / "torch").exists()
+    assert (fake_site / "numpy").exists()
+
+
+def test_cleanup_zombie_dirs_empty_when_no_zombies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    fake_site = tmp_path / "site-packages"
+    fake_site.mkdir()
+    (fake_site / "torch").mkdir()
+    monkeypatch.setattr(ts.sysconfig, "get_path", lambda _key: str(fake_site))
+    assert ts._cleanup_zombie_dirs() == []
+
+
+def test_reinstall_calls_cleanup_zombie(
+    monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """reinstall 应在 pip 前后都调一次 cleanup（双保险）。"""
+    cleanup_calls: list[None] = []
+    monkeypatch.setattr(
+        ts, "_cleanup_zombie_dirs",
+        lambda: (cleanup_calls.append(None), [])[1],
+    )
+    monkeypatch.setattr(ts, "_pip", lambda args, **_kw: (0, "ok"))
+    monkeypatch.setattr(ts, "_pkg_version", lambda _: "2.5.0+cu128")
+
+    res = ts.reinstall("cu128")
+    # cleanup 调了两次（pip 前 + uninstall 后 install 前）
+    assert len(cleanup_calls) == 2
+    assert "cleaned_zombies" in res
+
+
 def test_reinstall_returns_stdout_tail(monkeypatch: pytest.MonkeyPatch) -> None:
     """stdout 长度 > 40 行时只保留尾部。"""
     long_log = "\n".join(f"line {i}" for i in range(100))

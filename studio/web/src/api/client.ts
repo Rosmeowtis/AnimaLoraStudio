@@ -127,13 +127,13 @@ export interface TorchStatus {
   /** 装了 CUDA wheel 但 cuda.is_available()=False → 驱动 / WSL 问题，pip 修不了。 */
   is_cuda_build_unavailable: boolean
 }
+/** torch reinstall 总是 deferred：server 写 marker，下次 launcher 启动时跑 pip。
+ *  这样避开 Windows 上 torch .pyd 已被 server 进程加载、pip 无法 replace 的死锁。 */
 export interface TorchReinstallResult {
+  pending: true                       // 永远 true，提示 UI 走「请重启」分支
   target: string                      // 用户传的（"auto" 等）
-  tag: TorchCuTag                     // 实际选定
-  index_url: string | null            // pip --index-url
-  version: string | null
-  stdout_tail: string
-  restart_required: boolean
+  tag: TorchCuTag                     // 实际选定（auto 已被 server 解析）
+  message: string                     // 中文人话提示，UI 直接显示
 }
 
 /** PR-7b — Flash Attention 安装状态 + 环境检测 + GitHub 候选 wheel。 */

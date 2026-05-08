@@ -83,56 +83,37 @@ def test_torch_status_proxies_service(
     assert body["recommended_cu_tag"] == "cu128"
 
 
-def test_torch_reinstall_success(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
+def test_torch_reinstall_registers_marker_returns_pending(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    from studio.services import torch_setup
-    captured: dict = {}
+    """POST /api/torch/reinstall 不真装，写 marker 返回 pending。"""
+    from studio.services import pending_install, torch_setup
+    monkeypatch.setattr(pending_install, "STUDIO_DATA", tmp_path)
+    monkeypatch.setattr(pending_install, "PENDING_MARKER", tmp_path / ".pending-pip-install.json")
+    monkeypatch.setattr(torch_setup, "_decide_target_tag", lambda _t: "cu128")
 
-    def fake_reinstall(target):
-        captured["target"] = target
-        return {
-            "target": target, "tag": "cu128",
-            "index_url": "https://download.pytorch.org/whl/cu128",
-            "version": "2.5.0+cu128", "stdout_tail": "ok",
-            "restart_required": True,
-        }
-
-    monkeypatch.setattr(torch_setup, "reinstall", fake_reinstall)
     resp = client.post("/api/torch/reinstall", json={"target": "auto"})
     assert resp.status_code == 200
     body = resp.json()
+    assert body["pending"] is True
     assert body["tag"] == "cu128"
-    assert body["restart_required"] is True
-    assert captured["target"] == "auto"
+    assert body["target"] == "auto"
+    assert "studio.bat" in body["message"]
+    # marker 文件已写
+    assert (tmp_path / ".pending-pip-install.json").exists()
 
 
 def test_torch_reinstall_invalid_target_returns_400(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from studio.services import torch_setup
-
-    def fake_reinstall(_target):
-        raise ValueError("非法 target: 'xpu'（应为 auto / cu128 / cu126 ...)")
-
-    monkeypatch.setattr(torch_setup, "reinstall", fake_reinstall)
+    monkeypatch.setattr(
+        torch_setup, "_decide_target_tag",
+        lambda t: (_ for _ in ()).throw(ValueError(f"非法 target: {t!r}")),
+    )
     resp = client.post("/api/torch/reinstall", json={"target": "xpu"})
     assert resp.status_code == 400
     assert "非法 target" in resp.json()["detail"]
-
-
-def test_torch_reinstall_pip_failure_returns_500(
-    client: TestClient, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from studio.services import torch_setup
-
-    def fake_reinstall(_target):
-        raise RuntimeError("安装 torch (cu128) 失败:\nERROR: 网络超时")
-
-    monkeypatch.setattr(torch_setup, "reinstall", fake_reinstall)
-    resp = client.post("/api/torch/reinstall", json={"target": "cu128"})
-    assert resp.status_code == 500
-    assert "网络超时" in resp.json()["detail"]
 
 
 def test_flash_attention_status_returns_env_and_candidates(

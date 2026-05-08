@@ -1192,16 +1192,18 @@ function PyTorchSection() {
 
   const reinstall = async (target: 'auto' | TorchCuTag) => {
     const tag = target === 'auto' ? status?.recommended_cu_tag ?? '?' : target
-    const msg = `将卸装当前 torch + torchvision，重装为 ${tag} 版。\n` +
-      `下载 ~3 GB，可能 5-30 分钟（视网速）。装完必须重启 Studio。继续？`
+    // 注册 → 用户 Ctrl+C 重启 → launcher 进程跑 pip。Windows 上 torch.pyd 被
+    // 当前 server 进程锁住，没法直接 replace；只能 defer 到 launcher。
+    const msg = `将注册 torch 重装请求（${tag} 版）。\n` +
+      `提交后请 Ctrl+C 关闭 Studio 重新运行 studio.bat —— 启动时会装 torch（~3 GB，5-30 分钟）。继续？`
     if (!confirm(msg)) return
     setBusy(true)
     try {
       const result = await api.reinstallTorch(target)
-      toast(`torch==${result.version ?? '?'} (${result.tag}) 安装成功，请重启 Studio`, 'success')
-      await refresh()
+      // 后端已写 marker，server 进程没真装；提示用户去重启
+      toast(result.message, 'success')
     } catch (e) {
-      toast(`安装失败: ${e}`, 'error')
+      toast(`注册失败: ${e}`, 'error')
     } finally {
       setBusy(false)
     }

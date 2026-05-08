@@ -293,6 +293,22 @@ def _spawn_browser_opener(url: str, *, delay: float = 1.0) -> None:
     t.start()
 
 
+def _apply_pending_install() -> None:
+    """启动期处理 server 进程不能完成的 pip 安装请求（torch 重装）。
+
+    必须在 `_check_torch_cuda` 之前跑：那里会 import torch，之后 .pyd 被锁就装不动了。
+    失败不抛 —— pending_install.apply_pending 内部已打印错误，让 launcher 继续起。
+    """
+    try:
+        from studio.services import pending_install  # noqa: PLC0415
+        pending_install.apply_pending()
+    except Exception as exc:  # noqa: BLE001
+        print(
+            f"[studio] 警告：处理 pending 安装请求时异常（{exc}），跳过",
+            file=sys.stderr,
+        )
+
+
 def _try_enable_flash_attn() -> None:
     """启动期检查 flash_attn 是否装好；装好就开 cosmos / anima 状态机。
 
@@ -510,6 +526,7 @@ def cmd_run(args: argparse.Namespace) -> int:
             rc = cmd_build(args)
             if rc != 0:
                 return rc
+    _apply_pending_install()
     _check_torch_cuda()
     _try_enable_flash_attn()
     _bootstrap_onnxruntime()
@@ -533,6 +550,7 @@ def cmd_dev(args: argparse.Namespace) -> int:
     rc = npm_install_if_missing(npm)
     if rc != 0:
         return rc
+    _apply_pending_install()
     _check_torch_cuda()
     _try_enable_flash_attn()
     _bootstrap_onnxruntime()

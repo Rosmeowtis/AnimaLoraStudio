@@ -1,4 +1,4 @@
-"""PyTorch 装包检测 + 一键重装服务（PR-S2）。
+"""PyTorch 装包检测 + 一键重装服务（PR-S2 / PR-S2.1）。
 
 为什么单立一个 service：
 - requirements.txt 写 `torch>=2.0.0` 不指 `--index-url`，pip 默认装 CPU wheel —— 用户
@@ -17,9 +17,12 @@ from __future__ import annotations
 
 import logging
 import re
+import shutil
 import subprocess
 import sys
+import sysconfig
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
+from pathlib import Path
 from typing import Any, Optional
 
 from . import onnxruntime_setup
@@ -192,24 +195,65 @@ def _decide_target_tag(target: str) -> str:
     )
 
 
+def _cleanup_zombie_dirs() -> list[str]:
+    """清掉 site-packages 里 pip 失败时留下的 `~*` 僵尸目录。
+
+    pip uninstall / install 失败后会留下 `~orch-...dist-info/`、`~orchvision/`
+    一类的临时目录（前缀 `~` 是 pip 的占位符表示「正在重命名中」）。这些目录会
+    导致下次 pip 装新 torch 时报 `Ignoring invalid distribution ~orch`，更严重
+    的是让 `import torch` 看到残留 dist-info 但实际 .pyd 缺失。
+
+    返回清理掉的路径列表，给日志用。Linux 上 site-packages 同样可能有 `~`-prefix
+    残留（极少见但 pip 行为相同），所以不用 platform-skip。
+    """
+    site_packages = Path(sysconfig.get_path("purelib"))
+    cleaned: list[str] = []
+    if not site_packages.is_dir():
+        return cleaned
+    for entry in site_packages.glob("~*"):
+        try:
+            if entry.is_dir():
+                shutil.rmtree(entry)
+            else:
+                entry.unlink()
+            cleaned.append(entry.name)
+        except OSError as exc:
+            logger.warning("[torch_setup] 清理僵尸目录 %s 失败: %s", entry, exc)
+    if cleaned:
+        logger.info("[torch_setup] 清理 pip 僵尸目录: %s", ", ".join(cleaned))
+    return cleaned
+
+
 def reinstall(target: str = "auto") -> dict[str, Any]:
     """卸装 torch + torchvision，按 target 重装。
 
     target: "auto" | "cu128" | "cu126" | "cu124" | "cu118" | "cpu"
-    返回 `{"target", "tag", "index_url", "stdout_tail", "restart_required": True}`。
+    返回 `{"target", "tag", "index_url", "version", "stdout_tail",
+            "restart_required": True, "cleaned_zombies": [...]}`。
     失败抛 RuntimeError。
 
     **重要**：torch 是 C extension，pip 卸装重装后**当前进程**已 import 的 .so/.pyd
-    不会热替换 —— 必须重启 Studio 才能切换到新 wheel。所以 `restart_required=True`。
+    不会热替换。Server 进程 import 过 torch 时，pip uninstall 也会撞 [WinError 5]。
+    所以本函数应在 launcher 进程跑（pending_install.apply_pending 调用），不在 server
+    进程的 `/api/torch/reinstall` 端点里同步跑（那里只写 marker）。
+
+    自愈：每次都先清 site-packages 里 `~*` 僵尸目录（之前失败留下的状态）。
     """
     tag = _decide_target_tag(target)
     index_url = _index_url_for(tag)
 
-    # 卸装：torch + torchvision 一对走（user-installed flash_attn / xformers 等不动，
+    # 第一步：清掉之前失败可能留下的僵尸目录。即使本次本来就没状态污染，也是
+    # cheap operation（site-packages 列目录 + glob '~*'），代价微乎其微。
+    cleaned = _cleanup_zombie_dirs()
+
+    # 第二步：卸装 torch + torchvision（user-installed flash_attn / xformers 等不动，
     # 跟 torch ABI 强绑定，但卸装 torch 不会自动卸它们 —— 用户重启后再 enable / 重装）
     rc1, log1 = _pip(["uninstall", "-y", "torch", "torchvision"])
 
-    # 安装：cu* 走 PyTorch 自家 index；cpu 也有自己的 index（不走 PyPI 默认避免歧义）
+    # 卸装后再清一次僵尸目录（pip 卸装失败也可能留 `~`-prefix 残留）
+    cleaned += _cleanup_zombie_dirs()
+
+    # 第三步：安装。cu* 走 PyTorch 自家 index；cpu 也有自己的 index（不走 PyPI 默认避免歧义）
     install_args = ["install", "torch", "torchvision"]
     if index_url:
         install_args += ["--index-url", index_url]
@@ -233,4 +277,5 @@ def reinstall(target: str = "auto") -> dict[str, Any]:
         "version": new_version,
         "stdout_tail": tail,
         "restart_required": True,
+        "cleaned_zombies": cleaned,
     }
