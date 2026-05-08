@@ -60,6 +60,7 @@ from .services import (
     model_downloader,
     flash_attention_setup,
     onnxruntime_setup,
+    torch_setup,
     reg_builder,
     tagedit,
     train_io,
@@ -1183,6 +1184,37 @@ def wd14_install(body: WD14InstallRequest) -> dict[str, Any]:
         "cuda_detect": onnxruntime_setup.detect_cuda(),
         "stdout_tail": tail,
     }
+
+
+# PyTorch 运行时 / 重装（PR-S2）-------------------------------------------
+
+
+@app.get("/api/torch/status")
+def torch_status() -> dict[str, Any]:
+    """返回 torch 当前状态 + 驱动检测 + 推荐 cu tag + 误装诊断 flag。
+
+    UI 用 `is_cpu_with_gpu` 决定是否显著提示「检测到 GPU 但装的是 CPU 版」。
+    `is_cuda_build_unavailable` 标志驱动 / WSL 问题（不是 pip 能修的，UI 给文档链接）。
+    """
+    return torch_setup.current_status()
+
+
+class TorchReinstallRequest(BaseModel):
+    target: str = "auto"  # "auto" | "cu128" | "cu126" | "cu124" | "cu118" | "cpu"
+
+
+@app.post("/api/torch/reinstall")
+def torch_reinstall(body: TorchReinstallRequest) -> dict[str, Any]:
+    """卸装 torch + torchvision 后按 target 重装；同步 pip，可能 5-30 分钟。
+
+    UI 按钮必须带 loading；torch 是 C extension，装完必须重启 Studio。
+    """
+    try:
+        return torch_setup.reinstall(body.target)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(500, str(exc)) from exc
 
 
 # FlashAttention runtime（PR-7b）-----------------------------------------

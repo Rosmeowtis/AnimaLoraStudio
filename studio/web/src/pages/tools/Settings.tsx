@@ -8,6 +8,8 @@ import {
   type ModelsCatalog,
   type Secrets,
   type SecretsPatch,
+  type TorchCuTag,
+  type TorchStatus,
   type WD14Runtime,
 } from '../../api/client'
 import PageHeader from '../../components/PageHeader'
@@ -509,6 +511,8 @@ export default function SettingsPage() {
           </div>
         </SettingsField>
       </SettingsSection>
+
+      <PyTorchSection />
 
       <FlashAttentionSection />
 
@@ -1152,6 +1156,184 @@ function ONNXRuntimeSection() {
             )}
           </>
         )}
+      </div>
+    </details>
+  )
+}
+
+// ── PyTorch Section（训练 tab）──────────────────────────────────────────────
+//
+// 已有 venv 用户的「一键修」入口。PR-4 启动期会 warn「检测到 GPU 但 torch 是
+// CPU 版」并给 pip 命令；这里把命令 UI 化，普通用户不用进终端。
+//
+// 三种状态：
+// - cuda_available=True               → ✓ 一切 OK（折叠默认；提供「换 CUDA 版本」高级选项）
+// - is_cpu_with_gpu=True               → 红色误装提示 + 显著「重装为 CUDA」主按钮
+// - is_cuda_build_unavailable=True     → 黄色驱动警告（pip 修不了，给文档链接）
+
+function PyTorchSection() {
+  const [status, setStatus] = useState<TorchStatus | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [advancedOpen, setAdvancedOpen] = useState(false)
+  const { toast } = useToast()
+
+  const refresh = useCallback(async () => {
+    try {
+      const s = await api.getTorchStatus()
+      setStatus(s)
+      setError(null)
+    } catch (e) {
+      setError(String(e))
+    }
+  }, [])
+
+  useEffect(() => { void refresh() }, [refresh])
+
+  const reinstall = async (target: 'auto' | TorchCuTag) => {
+    const tag = target === 'auto' ? status?.recommended_cu_tag ?? '?' : target
+    const msg = `将卸装当前 torch + torchvision，重装为 ${tag} 版。\n` +
+      `下载 ~3 GB，可能 5-30 分钟（视网速）。装完必须重启 Studio。继续？`
+    if (!confirm(msg)) return
+    setBusy(true)
+    try {
+      const result = await api.reinstallTorch(target)
+      toast(`torch==${result.version ?? '?'} (${result.tag}) 安装成功，请重启 Studio`, 'success')
+      await refresh()
+    } catch (e) {
+      toast(`安装失败: ${e}`, 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const hasIssue = !!error || (status && (status.is_cpu_with_gpu || status.is_cuda_build_unavailable || !status.installed))
+  const statusOk = status?.cuda_available && !error
+  const statusLabel = error
+    ? '加载失败'
+    : !status
+      ? '加载中...'
+      : !status.installed
+        ? '未安装'
+        : status.is_cpu_with_gpu
+          ? 'CPU 版（误装）'
+          : !status.cuda_available && status.cuda_build !== 'cpu'
+            ? 'CUDA 不可用（驱动？）'
+            : status.cuda_available
+              ? `CUDA ✓ ${status.cuda_build}`
+              : `CPU ${status.cuda_build}`
+
+  return (
+    <details open={!!hasIssue} className="rounded-md border border-subtle bg-surface group">
+      <summary className="cursor-pointer p-4 list-none flex items-center gap-2">
+        <span className="text-fg-tertiary text-xs transition-transform group-open:rotate-90 inline-block w-3">▸</span>
+        <h2 className="text-sm font-semibold text-fg-primary m-0">PyTorch</h2>
+        <span className="text-xs text-fg-tertiary">训练核心依赖</span>
+        <span className={`ml-auto text-xs font-mono ${statusOk ? 'text-ok' : status?.is_cpu_with_gpu ? 'text-err' : 'text-warn'}`}>
+          {statusLabel}
+        </span>
+      </summary>
+
+      <div className="px-4 pb-4 flex flex-col gap-3">
+        {error && <div className="text-err text-xs font-mono">{error}</div>}
+        {!error && !status && <div className="text-xs text-fg-tertiary">加载状态...</div>}
+
+        {status && (<>
+          {/* 当前状态卡 */}
+          <div className="rounded-sm border border-subtle bg-sunken p-2 flex flex-col gap-1 text-xs">
+            <div className="flex gap-4 flex-wrap">
+              <span className="text-fg-tertiary">torch: <code className="text-fg-secondary font-mono">{status.version ?? '（未安装）'}</code></span>
+              {status.cuda_build && (
+                <span className="text-fg-tertiary">build: <code className="text-fg-secondary font-mono">{status.cuda_build}</code></span>
+              )}
+              {status.cuda_available && status.device_name && (
+                <span className="text-fg-tertiary">GPU: <code className="text-fg-secondary font-mono">{status.device_name}</code></span>
+              )}
+            </div>
+            <div className="flex gap-4 flex-wrap">
+              <span className="text-fg-tertiary">
+                NVIDIA 驱动:{' '}
+                <code className="text-fg-secondary font-mono">
+                  {status.cuda_detect.driver_version ?? '未检测到'}
+                </code>
+              </span>
+              {status.cuda_detect.gpu_name && !status.cuda_available && (
+                <span className="text-fg-tertiary">
+                  系统 GPU:{' '}
+                  <code className="text-fg-secondary font-mono">{status.cuda_detect.gpu_name}</code>
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* 误装：CPU torch + 有 GPU */}
+          {status.is_cpu_with_gpu && (
+            <div className="rounded-sm border border-err bg-err-soft px-2 py-1.5 text-err text-xs">
+              检测到 NVIDIA GPU 但当前装的是 CPU 版 torch —— 训练 / 出图会跑在 CPU 上，单步常需数十秒。
+              点下方按钮一键重装为 <code className="font-mono">{status.recommended_cu_tag}</code> 版。
+            </div>
+          )}
+
+          {/* CUDA build 但运行时不可用：驱动 / WSL 问题 */}
+          {status.is_cuda_build_unavailable && (
+            <div className="rounded-sm border border-warn bg-warn-soft px-2 py-1.5 text-warn text-xs">
+              torch 是 CUDA 版但 <code className="font-mono">torch.cuda.is_available()=False</code>。
+              这通常不是 pip 能修的（驱动版本过低 / WSL 缺 CUDA 支持 / 容器无 GPU 直通）。
+              请检查 NVIDIA 驱动与 CUDA Toolkit。
+            </div>
+          )}
+
+          {/* 操作按钮 */}
+          <div className="flex gap-1.5 items-center flex-wrap">
+            <button
+              onClick={() => void reinstall('auto')}
+              disabled={busy || !status.cuda_detect.available}
+              className={status.is_cpu_with_gpu ? 'btn btn-primary btn-sm' : 'btn btn-secondary btn-sm'}
+              title={status.cuda_detect.available
+                ? `自动选择：${status.recommended_cu_tag}`
+                : '没检测到 NVIDIA 驱动，无法装 CUDA 版'}
+            >
+              {busy ? '安装中...' : status.is_cpu_with_gpu
+                ? `⤓ 重装为 CUDA 版（${status.recommended_cu_tag}）`
+                : `↻ 重装（auto: ${status.recommended_cu_tag}）`}
+            </button>
+            <button onClick={() => void refresh()} disabled={busy}
+              className="px-2 py-0.5 text-fg-tertiary bg-transparent border-none cursor-pointer rounded-sm">↻</button>
+            <button type="button" onClick={() => setAdvancedOpen(!advancedOpen)}
+              className="btn btn-ghost btn-sm text-xs text-fg-tertiary ml-auto">
+              {advancedOpen ? '▾' : '▸'} 高级（手动选 CUDA 版本）
+            </button>
+          </div>
+
+          {/* 手动选版本 */}
+          {advancedOpen && (
+            <div className="flex flex-col gap-1.5 pt-2 border-t border-subtle text-xs">
+              <p className="text-fg-tertiary m-0">
+                按你的驱动 / 偏好选；通常用 auto 即可。
+                选错版本会在 import 时报错，需重新选。
+              </p>
+              <div className="flex gap-1.5 flex-wrap">
+                {(['cu128', 'cu126', 'cu124', 'cu118', 'cpu'] as const).map((tag) => (
+                  <button
+                    key={tag}
+                    onClick={() => void reinstall(tag)}
+                    disabled={busy}
+                    className={`btn btn-secondary btn-sm ${
+                      status.cuda_build === tag ? 'border-accent' : ''
+                    }`}
+                    title={
+                      tag === 'cpu'
+                        ? '装 CPU 版（极慢，仅诊断 / 无 GPU 用）'
+                        : `装 ${tag} 版（PyTorch index: /whl/${tag}）`
+                    }
+                  >
+                    {tag}{status.cuda_build === tag ? ' ✓' : ''}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+        </>)}
       </div>
     </details>
   )

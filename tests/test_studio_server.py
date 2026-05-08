@@ -60,6 +60,81 @@ def test_health_returns_ok(client: TestClient) -> None:
 # /api/state
 # ---------------------------------------------------------------------------
 
+def test_torch_status_proxies_service(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GET /api/torch/status 把 torch_setup.current_status() 透传给前端。"""
+    from studio.services import torch_setup
+    monkeypatch.setattr(torch_setup, "current_status", lambda: {
+        "installed": True,
+        "version": "2.5.0+cpu",
+        "cuda_build": "cpu",
+        "cuda_available": False,
+        "device_name": None,
+        "cuda_detect": {"available": True, "driver_version": "555.86", "gpu_name": "RTX 5090"},
+        "recommended_cu_tag": "cu128",
+        "is_cpu_with_gpu": True,
+        "is_cuda_build_unavailable": False,
+    })
+    resp = client.get("/api/torch/status")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["is_cpu_with_gpu"] is True
+    assert body["recommended_cu_tag"] == "cu128"
+
+
+def test_torch_reinstall_success(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from studio.services import torch_setup
+    captured: dict = {}
+
+    def fake_reinstall(target):
+        captured["target"] = target
+        return {
+            "target": target, "tag": "cu128",
+            "index_url": "https://download.pytorch.org/whl/cu128",
+            "version": "2.5.0+cu128", "stdout_tail": "ok",
+            "restart_required": True,
+        }
+
+    monkeypatch.setattr(torch_setup, "reinstall", fake_reinstall)
+    resp = client.post("/api/torch/reinstall", json={"target": "auto"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["tag"] == "cu128"
+    assert body["restart_required"] is True
+    assert captured["target"] == "auto"
+
+
+def test_torch_reinstall_invalid_target_returns_400(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from studio.services import torch_setup
+
+    def fake_reinstall(_target):
+        raise ValueError("非法 target: 'xpu'（应为 auto / cu128 / cu126 ...)")
+
+    monkeypatch.setattr(torch_setup, "reinstall", fake_reinstall)
+    resp = client.post("/api/torch/reinstall", json={"target": "xpu"})
+    assert resp.status_code == 400
+    assert "非法 target" in resp.json()["detail"]
+
+
+def test_torch_reinstall_pip_failure_returns_500(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from studio.services import torch_setup
+
+    def fake_reinstall(_target):
+        raise RuntimeError("安装 torch (cu128) 失败:\nERROR: 网络超时")
+
+    monkeypatch.setattr(torch_setup, "reinstall", fake_reinstall)
+    resp = client.post("/api/torch/reinstall", json={"target": "cu128"})
+    assert resp.status_code == 500
+    assert "网络超时" in resp.json()["detail"]
+
+
 def test_flash_attention_status_returns_env_and_candidates(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

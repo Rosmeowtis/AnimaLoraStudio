@@ -108,6 +108,34 @@ export interface CLTaggerConfig {
   batch_size: number
 }
 
+/** PR-S2 — PyTorch 安装状态 + 驱动检测 + 推荐 cu tag。 */
+export type TorchCuTag = 'cu128' | 'cu126' | 'cu124' | 'cu118' | 'cpu'
+export interface TorchStatus {
+  installed: boolean
+  version: string | null              // "2.5.0+cu128"
+  cuda_build: TorchCuTag | null       // 解析自 +suffix
+  cuda_available: boolean             // torch.cuda.is_available()
+  device_name: string | null          // "NVIDIA GeForce RTX 5090"
+  cuda_detect: {
+    available: boolean
+    driver_version: string | null
+    gpu_name: string | null
+  }
+  recommended_cu_tag: TorchCuTag      // 按驱动版本推荐
+  /** 装了 CPU wheel 但有 NVIDIA GPU → 误装，UI 显示「重装为 CUDA 版」红色提示。 */
+  is_cpu_with_gpu: boolean
+  /** 装了 CUDA wheel 但 cuda.is_available()=False → 驱动 / WSL 问题，pip 修不了。 */
+  is_cuda_build_unavailable: boolean
+}
+export interface TorchReinstallResult {
+  target: string                      // 用户传的（"auto" 等）
+  tag: TorchCuTag                     // 实际选定
+  index_url: string | null            // pip --index-url
+  version: string | null
+  stdout_tail: string
+  restart_required: boolean
+}
+
 /** PR-7b — Flash Attention 安装状态 + 环境检测 + GitHub 候选 wheel。 */
 export interface FlashAttnEnv {
   python_tag: string                 // cp311
@@ -1154,6 +1182,17 @@ export const api = {
   /** 切换 onnxruntime（同步 pip，几分钟级；UI 必须带 loading）。 */
   installWD14Runtime: (target: 'auto' | 'gpu' | 'cpu') =>
     req<WD14InstallResult>('/api/wd14/install', {
+      method: 'POST',
+      body: JSON.stringify({ target }),
+    }),
+
+  // PR-S2 — PyTorch 运行时 / 一键重装 ---------------------------------------
+  /** 当前 torch 状态：版本 / CUDA build / cuda.is_available / 驱动检测 / 推荐 cu tag。 */
+  getTorchStatus: () => req<TorchStatus>('/api/torch/status'),
+  /** 卸装重装 torch + torchvision；同步 pip，可能 5-30 分钟，UI 必须带 loading。
+   *  装完必须重启 Studio（C extension 不能热替换）。 */
+  reinstallTorch: (target: 'auto' | TorchCuTag) =>
+    req<TorchReinstallResult>('/api/torch/reinstall', {
       method: 'POST',
       body: JSON.stringify({ target }),
     }),
