@@ -177,3 +177,74 @@ def test_apply_loras_skips_missing_path(tmp_path: Path) -> None:
 def test_apply_loras_empty_specs() -> None:
     model = MagicMock()
     assert apply_loras(model, [], device="cpu", dtype=torch.float32) == []
+
+
+# ---------------------------------------------------------------------------
+# generate tempdir helpers
+# ---------------------------------------------------------------------------
+
+
+def test_generate_tempdir_path() -> None:
+    """tempdir 路径基于 task_id，落在系统 tempdir 下。"""
+    import tempfile
+    from studio.services.inference_core import (
+        GENERATE_TEMP_PREFIX,
+        generate_tempdir,
+    )
+    d = generate_tempdir(42)
+    assert d.parent == Path(tempfile.gettempdir())
+    assert d.name == f"{GENERATE_TEMP_PREFIX}42"
+
+
+def test_cleanup_generate_tempdir_removes_dir() -> None:
+    """cleanup_generate_tempdir 清掉对应 task 的目录。"""
+    from studio.services.inference_core import (
+        cleanup_generate_tempdir,
+        generate_tempdir,
+    )
+    d = generate_tempdir(99999)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "img.png").write_bytes(b"\x89PNG")
+    assert d.exists()
+
+    cleanup_generate_tempdir(99999)
+    assert not d.exists()
+
+
+def test_cleanup_generate_tempdir_noop_when_missing() -> None:
+    """目录不存在时调 cleanup 是 noop（非 generate task 也安全）。"""
+    from studio.services.inference_core import (
+        cleanup_generate_tempdir,
+        generate_tempdir,
+    )
+    d = generate_tempdir(88888)
+    if d.exists():
+        import shutil
+        shutil.rmtree(d)
+    cleanup_generate_tempdir(88888)
+
+
+def test_cleanup_stale_generate_tempdirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """启动扫清：把所有 anima_gen_* 目录全清。"""
+    import tempfile
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    from studio.services.inference_core import (
+        GENERATE_TEMP_PREFIX,
+        cleanup_stale_generate_tempdirs,
+    )
+
+    leak1 = tmp_path / f"{GENERATE_TEMP_PREFIX}111"
+    leak2 = tmp_path / f"{GENERATE_TEMP_PREFIX}222"
+    keep = tmp_path / "unrelated_dir"
+    leak1.mkdir()
+    (leak1 / "x.png").write_bytes(b"\x89")
+    leak2.mkdir()
+    keep.mkdir()
+    (keep / "important.txt").write_text("dont touch")
+
+    cleanup_stale_generate_tempdirs()
+
+    assert not leak1.exists()
+    assert not leak2.exists()
+    assert keep.exists()  # 不带前缀的不动
+    assert (keep / "important.txt").exists()

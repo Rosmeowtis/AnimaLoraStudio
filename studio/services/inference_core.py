@@ -23,11 +23,18 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
 logger = logging.getLogger(__name__)
+
+# 测试出图 task 的临时输出目录前缀。每个 task 一个 anima_gen_{task_id}/。
+# 用户决策：测试页面出图不保存，task 结束 supervisor 清掉整个目录；
+# studio 启动时扫一遍清遗留（防 supervisor crash 时 leak）。
+GENERATE_TEMP_PREFIX = "anima_gen_"
 
 
 # 缺 metadata 时的回退值。与 AnimaLycorisAdapter 默认对齐。
@@ -162,3 +169,43 @@ def apply_loras(
         adapters.append(adapter)
 
     return adapters
+
+
+# ---------------------------------------------------------------------------
+# Generate 测试出图：临时目录管理
+# ---------------------------------------------------------------------------
+
+
+def generate_tempdir(task_id: int) -> Path:
+    """单个 generate task 的临时输出目录路径。
+
+    位于系统 tempdir 下（与 studio_data 隔离），task 完成清掉。
+    """
+    return Path(tempfile.gettempdir()) / f"{GENERATE_TEMP_PREFIX}{task_id}"
+
+
+def cleanup_generate_tempdir(task_id: int) -> None:
+    """task 结束时清单个 tempdir。目录不存在视为 noop（非 generate task 也安全调）。"""
+    d = generate_tempdir(task_id)
+    if not d.exists():
+        return
+    try:
+        shutil.rmtree(d)
+        logger.info(f"cleaned generate tempdir: {d}")
+    except OSError as e:
+        logger.warning(f"failed to clean {d}: {e}")
+
+
+def cleanup_stale_generate_tempdirs() -> None:
+    """启动时扫清所有 anima_gen_* 遗留目录（防 supervisor crash 泄漏）。"""
+    parent = Path(tempfile.gettempdir())
+    if not parent.exists():
+        return
+    for d in parent.glob(f"{GENERATE_TEMP_PREFIX}*"):
+        if not d.is_dir():
+            continue
+        try:
+            shutil.rmtree(d)
+            logger.info(f"cleaned stale generate tempdir: {d}")
+        except OSError as e:
+            logger.warning(f"failed to clean stale {d}: {e}")

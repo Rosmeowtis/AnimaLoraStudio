@@ -619,6 +619,13 @@ class Supervisor:
                 # PP6.3：训练成功时回填 version.output_lora_path + 推 stage=done
                 if status == "done":
                     _maybe_finalize_version(conn, cid)
+            # 测试出图 tempdir 清理：generate task 结束（任意状态）都清掉。
+            # 函数内部 if d.exists() 兜底，非 generate task 调进来也安全。
+            try:
+                from .services.inference_core import cleanup_generate_tempdir
+                cleanup_generate_tempdir(cid)
+            except Exception as e:
+                logger.warning("cleanup generate tempdir failed: %s", e)
             self._on_event(
                 {"type": "task_state_changed", "task_id": cid, "status": status}
             )

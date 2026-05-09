@@ -407,6 +407,54 @@ class TrainingConfig(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# 测试出图（独立工具页，多 LoRA + multi-prompt）—— 对应 tools/anima_generate.py
+# ---------------------------------------------------------------------------
+
+
+class GenerateConfig(BaseModel):
+    """测试出图任务参数。对应 tools/anima_generate.py 的 JSON 配置。
+
+    LoRA 加载走 inference_core.apply_loras —— 每份 LoRA 独立 inject，
+    rank/alpha 从 ss_network_args 读，正确合并多 LoRA。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 模型路径（服务端从 secrets 填充）
+    transformer_path: str = Field("models/diffusion_models/anima-preview3-base.safetensors")
+    vae_path: str = Field("models/vae/qwen_image_vae.safetensors")
+    text_encoder_path: str = Field("models/text_encoders")
+    t5_tokenizer_path: str = Field("models/t5_tokenizer")
+
+    # 生成参数
+    prompts: list[str] = Field(
+        default_factory=lambda: ["newest, safe, 1girl, masterpiece, best quality"],
+        description="正向提示词列表（每条 prompt 生成 count 张）",
+    )
+    negative_prompt: str = Field("")
+    width: int = Field(1024, ge=256, le=4096)
+    height: int = Field(1024, ge=256, le=4096)
+    steps: int = Field(25, ge=1, le=150)
+    cfg_scale: float = Field(4.0, ge=0.0, le=20.0)
+    sampler_name: str = Field("er_sde")
+    scheduler: str = Field("simple")
+    count: int = Field(1, ge=1, le=32, description="每个 prompt 生成张数")
+    seed: int = Field(0, description="随机种子（0=随机）")
+
+    # LoRA（多 LoRA 独立 inject + multiplier=scale 控贡献权重）
+    lora_configs: list[dict] = Field(
+        default_factory=list,
+        description="LoRA 列表，每项 {path: str, scale: float}",
+    )
+
+    # 运行时
+    output_dir: str = Field("", description="输出目录（服务端填 tempdir，task 结束清）")
+    mixed_precision: str = Field("bf16")
+    xformers: bool = Field(False)
+    flash_attn: bool = Field(True)
+
+
+# ---------------------------------------------------------------------------
 # 先验生成（base 模型对每张训练图反向出对照图作正则集）—— 对应 tools/anima_reg_ai.py
 # ---------------------------------------------------------------------------
 

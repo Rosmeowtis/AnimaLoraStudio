@@ -78,7 +78,7 @@ from .paths import (
     WEB_DIST,
     ensure_dirs,
 )
-from .schema import GROUP_ORDER, RegAiConfig, TrainingConfig
+from .schema import GROUP_ORDER, GenerateConfig, RegAiConfig, TrainingConfig
 from .supervisor import Supervisor
 
 ensure_dirs()
@@ -90,6 +90,10 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def _lifespan(app_: FastAPI) -> AsyncIterator[None]:
     """启动绑定 event bus 到当前 loop 并起 supervisor；关闭时停 supervisor。"""
+    # 测试出图 tempdir 遗留清扫（防 supervisor crash 泄漏 anima_gen_* 目录）
+    from .services.inference_core import cleanup_stale_generate_tempdirs
+    cleanup_stale_generate_tempdirs()
+
     bus.attach_loop(asyncio.get_running_loop())
     sup = Supervisor(on_event=bus.publish)
     sup.start()
@@ -1704,6 +1708,106 @@ def get_reg_prior_task(pid: int, vid: int, task_id: int) -> dict[str, Any]:
     if not task or task.get("task_type") != "reg_ai":
         raise HTTPException(404)
     return task
+
+
+# ---------------------------------------------------------------------------
+# /api/generate — 测试出图（独立工具页，多 LoRA + multi-prompt）
+# ---------------------------------------------------------------------------
+#
+# 用户决策："测试" 出图不保存：图写到 tempfile.gettempdir() / anima_gen_{task_id}/，
+# task 结束 supervisor 自动清；启动时扫清遗留。前端没有 history 列表 —— 看完即丢。
+
+
+class LoraEntry(BaseModel):
+    """Generate 端点的 LoRA 项（path + scale）。"""
+    path: str
+    scale: float = 1.0
+
+
+class GenerateRequest(BaseModel):
+    prompts: list[str] = ["newest, safe, 1girl, masterpiece, best quality"]
+    negative_prompt: str = ""
+    width: int = 1024
+    height: int = 1024
+    steps: int = 25
+    cfg_scale: float = 4.0
+    sampler_name: str = "er_sde"
+    scheduler: str = "simple"
+    count: int = 1
+    seed: int = 0
+    lora_configs: list[LoraEntry] = []
+    mixed_precision: str = "bf16"
+    xformers: bool = False
+    flash_attn: bool = True
+
+
+@app.post("/api/generate")
+def enqueue_generate(body: GenerateRequest) -> dict[str, Any]:
+    """启动测试出图 task。"""
+    from .services.inference_core import generate_tempdir
+
+    model_paths = _resolve_anima_model_paths()
+
+    with db.connection_for() as conn:
+        task_id = db.create_task(
+            conn, name="generate", config_name="generate", priority=0,
+        )
+        db.update_task(conn, task_id, task_type="generate")
+
+    tempdir = generate_tempdir(task_id)
+    tempdir.mkdir(parents=True, exist_ok=True)
+
+    cfg = GenerateConfig(
+        **model_paths,
+        output_dir=str(tempdir),
+        prompts=body.prompts,
+        negative_prompt=body.negative_prompt,
+        width=body.width,
+        height=body.height,
+        steps=body.steps,
+        cfg_scale=body.cfg_scale,
+        sampler_name=body.sampler_name,
+        scheduler=body.scheduler,
+        count=body.count,
+        seed=body.seed,
+        lora_configs=[lc.model_dump() for lc in body.lora_configs],
+        mixed_precision=body.mixed_precision,
+        xformers=body.xformers,
+        flash_attn=body.flash_attn,
+    )
+
+    cfg_path = tempdir / "config.json"
+    cfg_path.write_text(cfg.model_dump_json(indent=2), encoding="utf-8")
+
+    with db.connection_for() as conn:
+        db.update_task(conn, task_id, config_path=str(cfg_path))
+        task = db.get_task(conn, task_id)
+
+    bus.publish({"type": "task_state_changed", "task_id": task_id, "status": "pending"})
+    return task or {"id": task_id}
+
+
+@app.get("/api/generate/{task_id}")
+def get_generate_task(task_id: int) -> dict[str, Any]:
+    """查询测试 task 状态。"""
+    with db.connection_for() as conn:
+        task = db.get_task(conn, task_id)
+    if not task or task.get("task_type") != "generate":
+        raise HTTPException(404)
+    return task
+
+
+@app.get("/api/generate/{task_id}/sample/{filename}")
+def get_generate_sample(task_id: int, filename: str) -> Any:
+    """读 generate task 的输出图（task 还在跑或刚结束时；清理后 404）。"""
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(400, "invalid filename")
+    from fastapi.responses import FileResponse
+    from .services.inference_core import generate_tempdir
+    img = generate_tempdir(task_id) / filename
+    if not img.exists() or img.suffix.lower() not in datasets.IMAGE_EXTS:
+        raise HTTPException(404)
+    return FileResponse(str(img))
 
 
 @app.delete("/api/projects/{pid}/versions/{vid}/reg")
