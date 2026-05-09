@@ -37,7 +37,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
 from . import (
     browse,
@@ -67,6 +67,7 @@ from .services import (
     train_io,
     uploads as uploads_svc,
     version_config,
+    xformers_setup,
 )
 from .services.tagger import VALID_TAGGER_NAMES, get_tagger
 from .paths import (
@@ -78,7 +79,15 @@ from .paths import (
     WEB_DIST,
     ensure_dirs,
 )
-from .schema import GROUP_ORDER, GenerateConfig, LoraEntry, RegAiConfig, TrainingConfig
+from .schema import (
+    GROUP_ORDER,
+    AttentionBackend,
+    GenerateConfig,
+    LoraEntry,
+    RegAiConfig,
+    TrainingConfig,
+    migrate_legacy_attention,
+)
 from .supervisor import Supervisor
 
 ensure_dirs()
@@ -1271,6 +1280,34 @@ def flash_attn_install(body: FlashAttnInstallRequest) -> dict[str, Any]:
         raise HTTPException(500, str(exc)) from exc
 
 
+# xformers runtime ------------------------------------------------------
+
+
+@app.get("/api/xformers/status")
+def xformers_status() -> dict[str, Any]:
+    """返回 xformers 安装状态。
+
+    比 flash_attention/status 简洁很多 —— xformers 走 PyPI 直装，不需要 GitHub
+    候选 wheel 列表 / 环境检测细节（status 里 installed/version 已经够用）。
+    """
+    return xformers_setup.current_status()
+
+
+@app.post("/api/xformers/install")
+def xformers_install() -> dict[str, Any]:
+    """pip install xformers --index-url <torch-cu-index>。
+
+    同步执行；远端 wheel 通常几十到几百 MB，几分钟级。装失败抛 500，message
+    含 stderr 末尾（多数失败 = 上游 wheel 没覆盖当前 torch+cu 组合）。
+
+    xformers 是 C extension，装完返回 restart_required=True 让 UI 提示重启。
+    """
+    try:
+        return xformers_setup.install()
+    except RuntimeError as exc:
+        raise HTTPException(500, str(exc)) from exc
+
+
 @app.get("/api/tagger/{name}/check")
 def check_tagger(name: str) -> dict[str, Any]:
     if name not in VALID_TAGGER_NAMES:
@@ -1640,8 +1677,13 @@ class RegAiRequest(BaseModel):
     seed: int = 0
     incremental: bool = False
     mixed_precision: str = "bf16"
-    xformers: bool = False
-    flash_attn: bool = True
+    attention_backend: AttentionBackend = "flash_attn"
+
+    # 兼容老前端送 xformers / flash_attn 双 bool（自动映射成 attention_backend）
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_attention(cls, data: Any) -> Any:
+        return migrate_legacy_attention(data)
 
 
 @app.post("/api/projects/{pid}/versions/{vid}/reg/generate-prior")
@@ -1675,8 +1717,7 @@ def reg_generate_prior(pid: int, vid: int, body: RegAiRequest) -> dict[str, Any]
         seed=body.seed,
         incremental=body.incremental,
         mixed_precision=body.mixed_precision,
-        xformers=body.xformers,
-        flash_attn=body.flash_attn,
+        attention_backend=body.attention_backend,
     )
 
     cfg_dir = STUDIO_DATA / "reg_ai_configs"
@@ -1731,8 +1772,13 @@ class GenerateRequest(BaseModel):
     seed: int = 0
     lora_configs: list[LoraEntry] = []
     mixed_precision: str = "bf16"
-    xformers: bool = False
-    flash_attn: bool = True
+    attention_backend: AttentionBackend = "flash_attn"
+
+    # 兼容老前端送 xformers / flash_attn 双 bool（自动映射成 attention_backend）
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_attention(cls, data: Any) -> Any:
+        return migrate_legacy_attention(data)
 
 
 @app.post("/api/generate")
@@ -1766,8 +1812,7 @@ def enqueue_generate(body: GenerateRequest) -> dict[str, Any]:
         seed=body.seed,
         lora_configs=[lc.model_dump() for lc in body.lora_configs],
         mixed_precision=body.mixed_precision,
-        xformers=body.xformers,
-        flash_attn=body.flash_attn,
+        attention_backend=body.attention_backend,
     )
 
     cfg_path = tempdir / "config.json"

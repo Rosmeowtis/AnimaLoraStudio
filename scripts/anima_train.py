@@ -131,10 +131,15 @@ def apply_yaml_config(args, config):
     实现走 studio.argparse_bridge.merge_yaml_into_namespace —— 字段名 / 默认值
     都从 studio.schema.TrainingConfig 这一份单一权威源派生，避免与 parse_args
     脱节。未在 schema 中的 YAML 键会被忽略（拼写错误一目了然）。
+
+    在 merge 前调用 migrate_legacy_attention 兜底老 yaml 的 xformers/flash_attn
+    双 bool —— argparse_bridge 不走 pydantic validator，schema 层的迁移逻辑
+    无法生效，所以这里显式做一次。
     """
     from studio.argparse_bridge import merge_yaml_into_namespace
-    from studio.schema import TrainingConfig
-    return merge_yaml_into_namespace(args, config or {}, TrainingConfig)
+    from studio.schema import TrainingConfig, migrate_legacy_attention
+    config = migrate_legacy_attention(dict(config or {}))
+    return merge_yaml_into_namespace(args, config, TrainingConfig)
 
 
 # Lazy imports after dependency check
@@ -473,8 +478,13 @@ def ensure_models_namespace(repo_root):
         sys.path.insert(0, str(repo_root.parent))
 
 
-def load_anima_model(transformer_path, device, dtype, repo_root):
-    """加载 Anima transformer 模型"""
+def load_anima_model(transformer_path, device, dtype, repo_root, *, flash_attn: bool = True):
+    """加载 Anima transformer 模型。
+
+    `flash_attn=False` 显式禁用 flash_attn fast path（attention_backend=xformers/none
+    时由 caller 传入），让 caller 完全决定 attention 实现 —— PR #17 那版默认
+    fn(True) 强制开 flash_attn 不让用户关，与 cfg.attention_backend 解耦不彻底。
+    """
     from safetensors import safe_open
 
     ensure_models_namespace(repo_root)
@@ -490,13 +500,17 @@ def load_anima_model(transformer_path, device, dtype, repo_root):
     )
     Anima = anima_modeling.Anima
 
-    # flash_attn 加速：模型类加载完后 try-enable。set_flash_attn_enabled 内部
-    # 检查 _FLASH_ATTN_AVAILABLE，未装时返回 False 不抛错，安全 idempotent。
+    # flash_attn 全局开关：set_flash_attn_enabled 内部检查 _FLASH_ATTN_AVAILABLE，
+    # 未装时返回 False 不抛错（idempotent）。用 caller 传入的 flash_attn 而不是
+    # 强制 True，让 attention_backend=none/xformers 时显式关掉。
     fn = getattr(cosmos_modeling, "set_flash_attn_enabled", None)
     if fn is not None:
         try:
-            if fn(True):
+            if fn(flash_attn):
                 logger.info("flash_attn 启用（训练 + sample 走 fast path）")
+            else:
+                logger.info("flash_attn 关闭（attention_backend=%s 或包未安装）",
+                            "flash_attn" if flash_attn else "non-flash")
         except Exception as exc:  # noqa: BLE001
             logger.warning("flash_attn 启用失败，继续走 SDPA fallback: %s", exc)
 
@@ -1906,13 +1920,22 @@ def main():
     if reg_data_dir:
         args.reg_data_dir = resolve_path_best_effort(reg_data_dir, bases)
 
+    # 按 attention_backend 决策：xformers / flash_attn / none。
+    # load_anima_model 内部按 flash_attn 参数设 flash_attn 全局开关；
+    # xformers 是 model 层面的额外注入（与 flash_attn 互斥）。
+    backend = getattr(args, "attention_backend", "flash_attn")
+    use_flash = (backend == "flash_attn")
+
     # 加载模型
     logger.info("加载 Transformer...")
-    model = load_anima_model(args.transformer_path, device, dtype, repo_root)
+    model = load_anima_model(
+        args.transformer_path, device, dtype, repo_root, flash_attn=use_flash,
+    )
 
-    # 启用 xformers
-    if args.xformers:
+    if backend == "xformers":
         enable_xformers(model)
+    elif backend == "none":
+        logger.info("attention_backend=none，flash_attn / xformers 都不启用，走 PyTorch SDPA")
 
     logger.info("加载 VAE...")
     vae = load_vae(args.vae_path, device, dtype, repo_root)
