@@ -175,8 +175,12 @@ def main() -> None:
     base_seed: int = int(cfg.get("seed", 0))
     incremental: bool = bool(cfg.get("incremental", False))
     mixed_precision: str = cfg.get("mixed_precision", "bf16")
-    xformers: bool = bool(cfg.get("xformers", False))
-    flash_attn: bool = bool(cfg.get("flash_attn", True))
+    # 兼容老 cfg 的 xformers/flash_attn 双 bool（schema.RegAiConfig.attention_backend 默认 flash_attn）
+    from studio.schema import migrate_legacy_attention
+    cfg = migrate_legacy_attention(cfg)
+    backend: str = cfg.get("attention_backend", "flash_attn")
+    use_flash = (backend == "flash_attn")
+    use_xformers = (backend == "xformers")
 
     transformer_path: str = cfg["transformer_path"]
     vae_path: str = cfg["vae_path"]
@@ -234,11 +238,9 @@ def main() -> None:
     if t5_tokenizer_path:
         t5_tokenizer_path = _T.resolve_path_best_effort(t5_tokenizer_path, bases)
 
-    use_flash = flash_attn and not xformers
-
     logger.info("加载 Transformer...")
     model = _T.load_anima_model(transformer_path, device, dtype, repo_root, flash_attn=use_flash)
-    if xformers:
+    if use_xformers:
         _T.enable_xformers(model)
 
     logger.info("加载 VAE...")
