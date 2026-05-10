@@ -2,49 +2,24 @@
 
 [![Version](https://img.shields.io/badge/version-0.5.0-blue)](CHANGELOG.md)
 
-Anima LoRA / LoKr 训练工具集，**附带完整 Web 工作台 (AnimaLoraStudio)**。
+**端到端流水线**：从 Booru 抓图 → 筛选 → 打标 → 正则集 → 训练 → 出图测试，全流程在一个浏览器面板里推进。专为 [Anima](https://huggingface.co/circlestone-labs/Anima)（Cosmos DiT 二次元特调）训练优化。
 
-从「准备数据 → 打标 → 正则集 → 训练 → 监控 → 下载 LoRA」一条流水线，在浏览器里点完。也支持纯 CLI 跑训练。
-
-输出的 LoRA 权重直接 ComfyUI 可用（`lora_unet_*` 格式，无需任何转换）。
-
-![Studio 训练页](docs/images/studio-train.png)
-
----
-
-## 上游与致谢
-
-本仓库的核心训练脚本派生自 [**Moeblack/AnimaLoraToolkit**](https://github.com/Moeblack/AnimaLoraToolkit)。
-
-- 主模型 / VAE：[circlestone-labs / Anima](https://huggingface.co/circlestone-labs/Anima)
-
----
-
-## 为什么用 AnimaLoraStudio
-
-不是又一个训练脚本 GUI，而是一条**端到端流水线**：从 Booru 抓图 → 筛选 → 打标 → 正则集 → 训练 → 出图测试，全流程在一个浏览器面板里推进。专为 [Anima](https://huggingface.co/circlestone-labs/Anima)（Cosmos DiT 二次元特调）训练优化。
-
-下面这些是独有特性，同类工具基本不做：
+## 特性
 
 - **🧬 Project / Version 双层数据模型** — 每次训练对应一个 `Project` + 一个 `Version`；version 可 fork（共享 download，独立 train/reg/output），方便 A/B 调参不重抓数据
 - **📦 正则集自动生成（Booru 反向搜）** — 基于 train 集 tag 分布贪心搜 booru，按长宽比聚类拼出**匹配画风**的 reg 集；或 **AI 先验生成**：无 LoRA 直接用底模出图当 reg 集
 - **🧪 内置出图测试 + XY 矩阵评测**（v0.5 新）— 训完直接在 Studio 里扫 LoRA 权重 / step / sampler 等参数出对比图，不用切 ComfyUI
-- **⚡ 推理 daemon 常驻 GPU**（v0.5 新）— XY 矩阵共享一次模型加载，跑一组扫描快 N 倍
 - **🌐 Booru 池** — 统一双 token bucket（API 2 / CDN 5 req/s）+ 并发 worker + 429 sticky 退避，download 和 reg 共用
 - **🛠️ 环境自愈系统** — venv stale 检测 / `--reinstall` 救命 flag / 首装 GPU-aware torch / Windows 锁文件 defer / ONNX CUDA 失败自动降 CPU；少有同类工具做这一层
 - **🚀 一键加速后端切换**（v0.5 新）— Settings 里一键装 xformers / flash_attn wheel，三选一切 attention backend，训练 / 出图共用
 - **🔁 Preset 双向流** — version 私有 config 和全局 preset 池可 fork / save_as_preset，参数实验不污染基线
-- **🇨🇳 国内开箱即用** — 默认走 hf-mirror 镜像；海外用户在 Settings 一键切回 huggingface.co 或自建反代
+
+![Studio 训练页](docs/images/studio-train.png)
 
 ### 训练核心 (`runtime/anima_train.py`)
 
 - LoRA + LyCORIS LoKr 双模式（走 [lycoris-lora](https://github.com/KohakuBlueleaf/LyCORIS) 官方库，含 DoRA / rs-LoRA / dropout；详见 [ADR 0001](docs/adr/0001-lokr-via-lycoris-lora.md)）
-- 输出**原生 ComfyUI 格式**（`lora_unet_*`），不需要任何转换
-- Flow Matching + ARB 分桶 + 梯度检查点
 - 三种 attention 后端：xformers / flash_attn / PyTorch SDPA，UI 切换或 CLI 指定
-- 断点续训（`state.pt` 含 optimizer / RNG / loss 历史，单文件，与 accelerate 多文件方案不同）
-- 多优化器：AdamW / AdamW8bit / Prodigy
-- bf16 / fp16 训练，训练时 sample 出图 + 实时 loss 曲线
 
 ### Studio Web 工作台 (`studio/`)
 
@@ -63,6 +38,13 @@ Anima LoRA / LoKr 训练工具集，**附带完整 Web 工作台 (AnimaLoraStudi
 - 监控页（React 原生 loss / lr 曲线 + 采样图条按 step 切换）
 - Settings 4 tab（数据集 / 打标 / 训练 / 页面）：凭据 / 模型一键下载 / PyTorch 一键重装 CUDA 版 / xformers / flash_attn 一键装 / HF 镜像切换
 - 暗色 / 日间模式 + 字号密度切换
+
+---
+
+## 上游与致谢
+
+- 核心训练脚本派生自 [**Moeblack/AnimaLoraToolkit**](https://github.com/Moeblack/AnimaLoraToolkit)。
+- 主模型 / VAE：[circlestone-labs / Anima](https://huggingface.co/circlestone-labs/Anima)
 
 ---
 
