@@ -42,6 +42,13 @@ class DanbooruConfig(BaseModel):
 
 class HuggingFaceConfig(BaseModel):
     token: str = ""
+    # PR-S3: HF 模型下载端点。`""` 走 huggingface_hub 默认（直连 huggingface.co）。
+    # 默认 `hf-mirror.com` —— 项目主战场是国内用户，海外用户 Settings 切换。
+    # 自定义 URL 也支持（tencent / sjtug / 自建反代等）。
+    # huggingface_hub>=0.20 起 hf_hub_download / snapshot_download 都支持 `endpoint=` kwarg，
+    # 我们 per-call 传，不依赖 HF_ENDPOINT env var（env var 只在模块 import 时读，
+    # runtime 改设置无效）。
+    endpoint: str = "https://hf-mirror.com"
 
 
 class DownloadConfig(BaseModel):
@@ -139,6 +146,20 @@ class ModelsConfig(BaseModel):
     selected_anima: str = "preview3-base"
 
 
+class GenerateConfig(BaseModel):
+    """测试出图 daemon 行为（PR Phase 2）。
+
+    - `preview_every_n_steps`：中间步预览节流。0=关；>0 → daemon 用 TAEFlux
+      decode 每 N 步推一张 256px JPEG 给前端。需要 TAEFlux 模型已下载
+      （settings 入口或 POST /api/generate/taeflux/install）。
+    - `attention_backend`：注意力后端选择。`'auto'`（默认）→ 装了什么用什么
+      （优先级 flash_attn > xformers > none/SDPA）；显式值（flash_attn/
+      xformers/none）则强制 —— 想 debug 或对比时手动指定。
+    """
+    preview_every_n_steps: int = 3
+    attention_backend: str = "auto"
+
+
 class Secrets(BaseModel):
     gelbooru: GelbooruConfig = Field(default_factory=GelbooruConfig)
     danbooru: DanbooruConfig = Field(default_factory=DanbooruConfig)
@@ -149,6 +170,7 @@ class Secrets(BaseModel):
     cltagger: CLTaggerConfig = Field(default_factory=CLTaggerConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     queue: QueueConfig = Field(default_factory=QueueConfig)
+    generate: GenerateConfig = Field(default_factory=GenerateConfig)
 
 
 # ---------------------------------------------------------------------------

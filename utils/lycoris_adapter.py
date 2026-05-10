@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -17,8 +17,14 @@ from safetensors.torch import save_file
 from safetensors import safe_open
 
 from utils.lokr_preset import apply as apply_anima_preset
+from utils.lycoris_patch import apply_lokr_device_patch
 
 logger = logging.getLogger(__name__)
+
+# lycoris-lora 3.4.0 LokrModule.get_weight rank_dropout device bug 一次性修复。
+# 模块级调用：任何路径走到 lycoris_adapter（CLI 训练 / Studio worker / 测试）
+# 都会先 patch 一次。返回值供测试断言；正常 import 路径下结果落到 logger。
+_LOKR_PATCH_STATUS = apply_lokr_device_patch()
 
 
 class AnimaLycorisAdapter:
@@ -57,6 +63,10 @@ class AnimaLycorisAdapter:
         # 保留此字段以避免改动太多调用点。
         self.use_lokr = (algo == "lokr")
         self.network = None  # lazy init in inject()
+        # commit 20：detach() 撤销 hook 用 —— inject 时记录 model 引用 +
+        # model.train 原始函数，detach 时还原。
+        self._injected_model: Optional[nn.Module] = None
+        self._orig_train: Optional[Any] = None
 
     # --------------------------------------------------------------- inject
     def inject(self, model: nn.Module) -> dict[str, nn.Module]:
@@ -105,6 +115,7 @@ class AnimaLycorisAdapter:
         # 分支，触发 lycoris 上游 bug：torch.rand(...) 没传 device，CPU mask 与 CUDA weight
         # 相乘报 device mismatch（lokr.py:380）。
         # 修复：劫持 model.train()，让 network 跟随；并立刻同步当前模式。
+        # commit 20：保存 _orig_train + _injected_model 让 detach() 能还原。
         _orig_train = model.train
         _network = self.network
 
@@ -114,10 +125,57 @@ class AnimaLycorisAdapter:
 
         model.train = _train_with_lycoris  # type: ignore[method-assign]
         self.network.train(model.training)
+        self._orig_train = _orig_train
+        self._injected_model = model
 
         n = len(self.network.loras)
         logger.info(f"注入 {self.algo.upper()} 到 {n} 层（lycoris-lora）")
         return {lora.lora_name: lora for lora in self.network.loras}
+
+    # --------------------------------------------------------------- detach
+    def detach(self) -> bool:
+        """撤销 inject：还原 model.train 钩子 + 调 LycorisNetwork.restore（如有）。
+
+        让 daemon 切换 LoRA 时不必重 load 整个 transformer。返回值：
+          - True：成功；旧 hook 已撤销，可安全 inject 新 LoRA
+          - False：lycoris 当前版本没暴露 restore 接口，hook 残留；调用方
+                  应 fallback 到模型整体 reload（粗暴但安全）
+
+        多次调用幂等（self.network=None 后直接 noop）。
+        """
+        if self.network is None:
+            return True
+
+        # 先尝试 lycoris 自带的 restore；不同版本接口名不同，挨个试
+        ok = True
+        for restore_attr in ("restore", "restore_apply", "remove_apply"):
+            fn = getattr(self.network, restore_attr, None)
+            if callable(fn):
+                try:
+                    fn()
+                    break
+                except Exception as e:
+                    logger.warning(f"LycorisNetwork.{restore_attr}() 失败: {e}")
+                    ok = False
+                    break
+        else:
+            # 三个接口都不存在 → 当前 lycoris 版本不支持热卸载
+            logger.warning("LycorisNetwork 无 restore/restore_apply/remove_apply 接口；hook 残留")
+            ok = False
+
+        # 还原 model.train 劫持（无论 restore 是否成功都该还原 monkey patch）
+        if self._injected_model is not None and self._orig_train is not None:
+            try:
+                self._injected_model.train = self._orig_train  # type: ignore[method-assign]
+            except Exception as e:
+                logger.warning(f"还原 model.train 失败: {e}")
+                ok = False
+
+        # 释放引用让 GC 清掉 LycorisNetwork（含 closure 内 _network 引用）
+        self.network = None
+        self._injected_model = None
+        self._orig_train = None
+        return ok
 
     # --------------------------------------------------------------- params
     def get_params(self) -> list[nn.Parameter]:

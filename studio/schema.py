@@ -13,11 +13,56 @@
 """
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def _meta(group: str, control: str = "auto", **extra: Any) -> dict[str, Any]:
     return {"group": group, "control": control, **extra}
+
+
+# ---------------------------------------------------------------------------
+# attention backend 字段：xformers / flash_attn / 无 三选一（替代原本两个 bool）
+# ---------------------------------------------------------------------------
+
+AttentionBackend = Literal["none", "xformers", "flash_attn"]
+
+
+def migrate_legacy_attention(data: Any) -> Any:
+    """把老 cfg 的 `xformers` / `flash_attn` 双 bool 映射成 `attention_backend`。
+
+    Idempotent：已有 attention_backend 就剥掉老字段；只有老字段时按下面规则映射；
+    都没有则保持空（让 schema default 生效）。
+
+    映射规则（与原代码 `use_flash = flash_attn and not xformers` 一致 — xformers 优先）：
+        xformers=true  → "xformers"
+        xformers=false, flash_attn=true → "flash_attn"
+        xformers=false, flash_attn=false → "none"
+
+    在两个地方调用：
+      1. schema model_validator(mode='before')（pydantic 校验前先洗）—— server
+         构造 cfg / 前端送老字段都兼容
+      2. runtime/anima_train.py apply_yaml_config 之前显式调一次 —— 子进程读老
+         yaml 时 argparse_bridge.merge_yaml_into_namespace 不走 pydantic validator,
+         需要这层兜底
+    """
+    if not isinstance(data, dict):
+        return data
+    if "attention_backend" in data:
+        data.pop("xformers", None)
+        data.pop("flash_attn", None)
+        return data
+    has_legacy = "xformers" in data or "flash_attn" in data
+    if not has_legacy:
+        return data
+    xf = bool(data.pop("xformers", False))
+    fa = bool(data.pop("flash_attn", True))
+    if xf:
+        data["attention_backend"] = "xformers"
+    elif fa:
+        data["attention_backend"] = "flash_attn"
+    else:
+        data["attention_backend"] = "none"
+    return data
 
 
 class TrainingConfig(BaseModel):
@@ -242,9 +287,9 @@ class TrainingConfig(BaseModel):
         description="梯度检查点（省显存）",
         json_schema_extra=_meta("training"),
     )
-    xformers: bool = Field(
-        False,
-        description="xformers attention（5090 推荐 false）",
+    attention_backend: AttentionBackend = Field(
+        "flash_attn",
+        description="Attention backend：none（PyTorch SDPA）/ xformers / Flash Attention（5090 推荐 flash_attn）",
         json_schema_extra=_meta("training"),
     )
     num_workers: int = Field(
@@ -252,6 +297,11 @@ class TrainingConfig(BaseModel):
         description="数据加载线程（Windows 必须 0）",
         json_schema_extra=_meta("training"),
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_attention(cls, data: Any) -> Any:
+        return migrate_legacy_attention(data)
 
     # ---------------------------------------------------------------- 输出/保存
     output_dir: str = Field(
@@ -404,6 +454,222 @@ class TrainingConfig(BaseModel):
         description="(已废弃) 旧 monitor server 自动开浏览器；当前忽略",
         json_schema_extra=_meta("monitor", hidden=True),
     )
+
+
+# ---------------------------------------------------------------------------
+# 测试出图（独立工具页，多 LoRA + multi-prompt）—— 对应 runtime/anima_generate.py
+# ---------------------------------------------------------------------------
+
+
+class LoraEntry(BaseModel):
+    """单个 LoRA 的加载参数。Generate / API 共享，避免 server.py 私有定义。"""
+
+    model_config = ConfigDict(extra="forbid")
+    path: str = Field(..., description="LoRA safetensors 绝对路径")
+    scale: float = Field(1.0, description="贡献权重（multiplier），多 LoRA 各自独立")
+    # 关联到的 version（picker 选的；外部文件无）；前端用 vid 拉 ckpt 列表
+    project_id: Optional[int] = Field(None, ge=1)
+    version_id: Optional[int] = Field(None, ge=1)
+
+
+# ---------------------------------------------------------------------------
+# XY 矩阵：轴枚举 + axis spec + matrix spec
+# ---------------------------------------------------------------------------
+#
+# 设计：单 task 内循环全图（一次 model load 摊销 ~30s 启动成本）。前端拿到
+# samples[].xy={xi,yi,xv,yv} 元数据按 (yi, xi) 排成 grid 渲染。
+#
+# 轴值类型按 axis 枚举派生：
+#   lora_scale / cfg_scale → float
+#   steps / seed           → int
+#   sampler_name           → str
+#
+# v1 暂不支持 lora_path 轴：AnimaLycorisAdapter 没有 unhook 接口，切换 LoRA
+# 文件需要 unload 旧 forward hook，留 v2。lora_scale 走 mutate
+# adapter.network.multiplier 的轻量路径，无 re-inject 成本。
+
+XYAxisType = Literal[
+    "lora_scale",   # 改 lora_configs[lora_index].scale 的多个值
+    "steps",        # 不同采样步数
+    "cfg_scale",    # 不同 CFG
+    "lora_ckpt",    # 同一 LoRA 训练过程的不同 step/epoch ckpt（找过拟合拐点）
+]
+
+
+class XYAxisSpec(BaseModel):
+    """单轴定义：axis 枚举 + values 列表 + (lora_axis 时) lora_index。"""
+
+    model_config = ConfigDict(extra="forbid")
+    axis: XYAxisType = Field(..., description="轴绑定的字段")
+    values: list[Any] = Field(..., min_length=1, description="此轴扫描的值列表")
+    lora_index: Optional[int] = Field(
+        None, ge=0,
+        description="axis=lora_scale / lora_ckpt 时指定改 lora_configs 哪一项",
+    )
+
+
+class XYMatrixSpec(BaseModel):
+    """XY 矩阵：x 轴必填，y 可选（None = 单轴 N×1 退化成一行）。"""
+
+    model_config = ConfigDict(extra="forbid")
+    x: XYAxisSpec
+    y: Optional[XYAxisSpec] = None
+
+
+def _check_axis_values(axis: XYAxisSpec) -> None:
+    """按 axis 枚举校验 values 类型（浮点 / 整数 / 字符串）。"""
+    int_axes = {"steps"}
+    float_axes = {"lora_scale", "cfg_scale"}
+    str_axes = {"lora_ckpt"}  # ckpt 路径列表
+    needs_lora_index = {"lora_scale", "lora_ckpt"}
+
+    if axis.axis in int_axes:
+        for v in axis.values:
+            if not isinstance(v, int) or isinstance(v, bool):
+                raise ValueError(f"axis={axis.axis} values 必须为 int，收到 {type(v).__name__}")
+    elif axis.axis in float_axes:
+        for v in axis.values:
+            if not isinstance(v, (int, float)) or isinstance(v, bool):
+                raise ValueError(f"axis={axis.axis} values 必须为 number，收到 {type(v).__name__}")
+    elif axis.axis in str_axes:
+        for v in axis.values:
+            if not isinstance(v, str):
+                raise ValueError(f"axis={axis.axis} values 必须为 str，收到 {type(v).__name__}")
+
+    if axis.axis in needs_lora_index and axis.lora_index is None:
+        raise ValueError(f"axis={axis.axis} 必须指定 lora_index（绑定到 lora_configs 哪一项）")
+    if axis.axis not in needs_lora_index and axis.lora_index is not None:
+        raise ValueError(f"axis={axis.axis} 不允许设 lora_index（仅 lora_scale / lora_ckpt 可设）")
+
+
+class GenerateConfig(BaseModel):
+    """测试出图任务参数。对应 runtime/anima_generate.py 的 JSON 配置。
+
+    LoRA 加载走 inference_core.apply_loras —— 每份 LoRA 独立 inject，
+    rank/alpha 从 ss_network_args 读，正确合并多 LoRA。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 模型路径（服务端从 secrets 填充）
+    transformer_path: str = Field("models/diffusion_models/anima-preview3-base.safetensors")
+    vae_path: str = Field("models/vae/qwen_image_vae.safetensors")
+    text_encoder_path: str = Field("models/text_encoders")
+    t5_tokenizer_path: str = Field("models/t5_tokenizer")
+
+    # 生成参数
+    prompts: list[str] = Field(
+        default_factory=lambda: ["newest, safe, 1girl, masterpiece, best quality"],
+        description="正向提示词列表（每条 prompt 生成 count 张）",
+    )
+    negative_prompt: str = Field("")
+    width: int = Field(1024, ge=256, le=4096)
+    height: int = Field(1024, ge=256, le=4096)
+    steps: int = Field(25, ge=1, le=150)
+    cfg_scale: float = Field(4.0, ge=0.0, le=20.0)
+    sampler_name: str = Field("er_sde")
+    scheduler: str = Field("simple")
+    count: int = Field(1, ge=1, le=32, description="每个 prompt 生成张数")
+    seed: int = Field(0, description="随机种子（0=随机）")
+
+    # LoRA（多 LoRA 独立 inject + multiplier=scale 控贡献权重）
+    lora_configs: list[LoraEntry] = Field(
+        default_factory=list,
+        description="LoRA 列表（每份独立 inject，multiplier=scale）",
+    )
+
+    # XY 矩阵（None=普通单图模式；设了就 anima_generate.py 走 XY 循环分支）
+    xy_matrix: Optional[XYMatrixSpec] = Field(
+        None,
+        description="XY 矩阵参数；设值时 prompts 限单条、count=1（避免排列爆炸）",
+    )
+
+    # 运行时
+    output_dir: str = Field("", description="输出目录（服务端填 tempdir，task 结束清）")
+    mixed_precision: str = Field("bf16")
+    attention_backend: AttentionBackend = Field(
+        "flash_attn",
+        description="Attention backend：none（SDPA）/ xformers / flash_attn",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_attention(cls, data: Any) -> Any:
+        return migrate_legacy_attention(data)
+
+    @model_validator(mode="after")
+    def _validate_xy(self) -> "GenerateConfig":
+        """XY 与 prompts/count 互斥；axis lora_index 必须指向已存在的 lora_configs。"""
+        if self.xy_matrix is None:
+            return self
+        if len(self.prompts) > 1:
+            raise ValueError("xy_matrix 与多 prompt 互斥（排列爆炸）—— 单 prompt 时才能开 XY")
+        if self.count != 1:
+            raise ValueError("xy_matrix 与 count>1 互斥 —— XY 模式下每个 (x,y) 出 1 张")
+        for label, axis in (("x", self.xy_matrix.x), ("y", self.xy_matrix.y)):
+            if axis is None:
+                continue
+            _check_axis_values(axis)
+            if axis.lora_index is not None and axis.lora_index >= len(self.lora_configs):
+                raise ValueError(
+                    f"xy_matrix.{label}.lora_index={axis.lora_index} 越界（仅 "
+                    f"{len(self.lora_configs)} 个 lora_configs）"
+                )
+        return self
+
+
+# ---------------------------------------------------------------------------
+# 先验生成（base 模型对每张训练图反向出对照图作正则集）—— 对应 runtime/anima_reg_ai.py
+# ---------------------------------------------------------------------------
+
+
+class RegAiConfig(BaseModel):
+    """先验生成的 JSON 配置（对应 runtime/anima_reg_ai.py）。
+
+    设计来自 DreamBooth prior preservation：训练损失同时见到「LoRA 学到的样子」和
+    「base 模型本来的样子」，让 LoRA 只学差异。**不带 LoRA** —— 出现 LoRA
+    反而会把要保留的 prior 给覆盖了。
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # 模型路径（服务端从 secrets 填充）
+    transformer_path: str = Field("")
+    vae_path: str = Field("")
+    text_encoder_path: str = Field("")
+    t5_tokenizer_path: str = Field("")
+
+    # 数据目录（服务端填充）
+    train_dir: str = Field("")
+    reg_dir: str = Field("")
+
+    # 生成控制
+    excluded_tags: list[str] = Field(
+        default_factory=list,
+        description="排除的 tag（不参与 prompt 拼接）",
+    )
+    negative_prompt: str = Field("")
+    width: int = Field(1024, ge=256, le=4096)
+    height: int = Field(1024, ge=256, le=4096)
+    steps: int = Field(25, ge=1, le=150)
+    cfg_scale: float = Field(4.0, ge=0.0, le=20.0)
+    sampler_name: str = Field("er_sde")
+    scheduler: str = Field("simple")
+    seed: int = Field(0, description="随机种子（0=随机）")
+    incremental: bool = Field(
+        False,
+        description="补足模式：跳过 reg 子文件夹中已有以 train_stem 开头的图（重启续跑用）",
+    )
+    mixed_precision: str = Field("bf16")
+    attention_backend: AttentionBackend = Field(
+        "flash_attn",
+        description="Attention backend：none（SDPA）/ xformers / flash_attn",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_attention(cls, data: Any) -> Any:
+        return migrate_legacy_attention(data)
 
 
 # ---------------------------------------------------------------------------

@@ -20,9 +20,14 @@ import yaml
 @pytest.fixture(scope="module")
 def at():
     """import anima_train 一次复用。"""
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    import anima_train  # noqa: PLC0415
-    return anima_train
+    import importlib.util  # noqa: PLC0415
+    repo_root = Path(__file__).resolve().parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "_anima_train_for_test", repo_root / "runtime" / "anima_train.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
 # ---------------------------------------------------------------------------
