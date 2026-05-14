@@ -16,6 +16,7 @@ Anima LoRA Trainer v2 - 支持 LyCORIS + 训练时推理
 
 import argparse
 import logging
+import math
 import os
 import random
 import subprocess
@@ -1813,12 +1814,126 @@ def sample_image(
 # 训练辅助
 # ============================================================================
 
-def sample_t(bs, device):
-    """采样时间步 (logit-normal)"""
-    t = torch.sigmoid(torch.randn(bs, device=device))
-    shift = 3.0
-    t = (t * shift) / (1 + (shift - 1) * t)
-    return t
+def sample_t(bs, device, mode: str = "logit_normal", shift: float = 3.0) -> torch.Tensor:
+    """采样 Flow Matching 时间步 t ∈ (0, 1)。
+
+    mode:
+      logit_normal      — SD3/Anima 默认，偏向中间 t；shift>1 推向高噪声端
+      uniform           — 均匀采样，对细节端和结构端覆盖更均衡
+      logit_normal_low  — logit-normal 反向 shift，偏向低噪声/细节端
+      mode              — SD3 mode-distribution，集中在某个 sigma 附近
+    """
+    mode = (mode or "logit_normal").lower()
+    u = torch.sigmoid(torch.randn(bs, device=device))
+
+    if mode == "uniform":
+        return torch.rand(bs, device=device).clamp(1e-4, 1 - 1e-4)
+
+    if mode == "logit_normal_low":
+        s = max(float(shift), 1e-4)
+        u = (u * (1.0 / s)) / (1 + (1.0 / s - 1) * u)
+        return u.clamp(1e-4, 1 - 1e-4)
+
+    if mode == "mode":
+        s = float(shift)
+        u = 1 - u - s * (torch.cos(torch.pi * 0.5 * u) ** 2 - 1 + u)
+        return u.clamp(1e-4, 1 - 1e-4)
+
+    # logit_normal（默认）+ shift
+    s = float(shift)
+    u = (u * s) / (1 + (s - 1) * u)
+    return u.clamp(1e-4, 1 - 1e-4)
+
+
+def make_noise(
+    latents: torch.Tensor,
+    noise_offset: float = 0.0,
+    pyramid_iters: int = 0,
+    pyramid_discount: float = 0.35,
+) -> torch.Tensor:
+    """生成训练噪声，可叠加低频扰动。
+
+    noise_offset   — 给每样本/通道加低频偏移，缓解亮度均值偏差（SDXL 思路）
+    pyramid_iters  — 叠加多尺度低频噪声，帮助模型快速学习全局光照/构图；
+                     bilinear 插值避免 nearest 的块状结构干扰
+    """
+    noise = torch.randn_like(latents)
+
+    if noise_offset > 0:
+        shape = list(latents.shape)
+        for ax in range(2, latents.ndim):
+            shape[ax] = 1
+        offset = torch.randn(*shape, device=latents.device, dtype=latents.dtype)
+        noise = noise + noise_offset * offset
+
+    if pyramid_iters > 0:
+        try:
+            spatial = list(latents.shape[-2:])
+            cur = noise.clone()
+            for i in range(pyramid_iters):
+                r = 2 ** (i + 1)
+                sh, sw = max(spatial[0] // r, 1), max(spatial[1] // r, 1)
+                if latents.ndim == 5:
+                    extra = torch.randn(
+                        latents.shape[0], latents.shape[1], latents.shape[2], sh, sw,
+                        device=latents.device, dtype=latents.dtype,
+                    )
+                    extra = F.interpolate(
+                        extra.flatten(0, 1), size=spatial, mode="bilinear", align_corners=False,
+                    ).view(latents.shape[0], latents.shape[1], latents.shape[2], *spatial)
+                else:
+                    extra = torch.randn(latents.shape[0], latents.shape[1], sh, sw,
+                                        device=latents.device, dtype=latents.dtype)
+                    extra = F.interpolate(extra, size=spatial, mode="bilinear", align_corners=False)
+                cur = cur + extra * (pyramid_discount ** (i + 1))
+                if min(sh, sw) <= 1:
+                    break
+            noise = cur / cur.std().clamp(min=1e-6)
+        except Exception as exc:
+            logger.warning(f"pyramid_noise 失败，回退标准噪声: {exc}")
+
+    return noise
+
+
+def compute_loss_weight(
+    t: torch.Tensor,
+    scheme: str = "none",
+    min_snr_gamma: float = 5.0,
+    weight_cap_ratio: float = 0.0,
+) -> torch.Tensor:
+    """返回每样本 loss 权重 (B,)，Flow Matching CONST 调度下：SNR(t) = ((1-t)/t)^2。
+
+    scheme:
+      none          — 全 1，与原始行为一致
+      min_snr       — w = min(gamma/SNR, 1)，下调高 SNR 简单步（推荐基础款）
+      detail_inv_t  — w = 1/t clamp [1,5]，温和细节强化，小 batch + Prodigy 友好
+      cosmap        — SD3 cosmap weighting，中间 t 更均匀（max/min ≈ 1.81×）
+
+    weight_cap_ratio — batch 内 max/min 比上限（0=禁用），防单样本主导破坏 Prodigy d 估计
+    """
+    scheme = (scheme or "none").lower()
+    if scheme == "none":
+        return torch.ones_like(t)
+
+    eps = 1e-4
+    t_c = t.clamp(eps, 1 - eps)
+
+    if scheme == "min_snr":
+        snr = ((1 - t_c) / t_c) ** 2
+        w = torch.minimum(torch.tensor(float(min_snr_gamma), device=t.device) / snr, torch.ones_like(t_c))
+    elif scheme == "detail_inv_t":
+        w = (1.0 / t_c).clamp(min=1.0, max=5.0)
+    elif scheme == "cosmap":
+        bot = (1 - 2 * t_c + 2 * t_c ** 2).clamp(min=eps)
+        w = 2.0 / (math.pi * bot)
+    else:
+        return torch.ones_like(t)
+
+    if weight_cap_ratio and weight_cap_ratio > 1.0:
+        w_min = w.min().clamp(min=eps)
+        w = w.clamp(max=w_min * float(weight_cap_ratio))
+
+    return w
 
 
 def collate_fn(batch):
@@ -2045,7 +2160,7 @@ def main():
         update_monitor(
             total_epochs=int(args.epochs or 0),
             config={
-                "model": "Anima LoKr" if args.lora_type == "lokr" else "Anima LoRA",
+                "model": {"lokr": "Anima LoKr"}.get(args.lora_type, "Anima LoRA"),
                 "rank": args.lora_rank,
                 "alpha": args.lora_alpha,
                 "epochs": args.epochs,
@@ -2110,7 +2225,7 @@ def main():
         args.text_encoder_path, args.t5_tokenizer_path, device, dtype
     )
 
-    # 注入 LoRA（lycoris-lora backend，Stage 3 切换）
+    # 注入 LoRA
     logger.info(f"注入 {args.lora_type.upper()}...")
     from utils.lycoris_adapter import AnimaLycorisAdapter
     injector = AnimaLycorisAdapter(
@@ -2405,6 +2520,8 @@ def main():
     
     current_epoch = start_epoch
     model.train()
+    if optimizer_type == "prodigy_plus_schedulefree" and hasattr(optimizer, "train"):
+        optimizer.train()
     step_start_time = time.perf_counter()
 
     # 设置采样提示词列表（支持多角色轮换）
@@ -2502,11 +2619,30 @@ def main():
                 cross = model.preprocess_text_embeds(qwen_emb, t5_ids)
                 if cross.shape[1] < 512:
                     cross = F.pad(cross, (0, 0, 0, 512 - cross.shape[1]))
+                # KV trim：把 padding 截到最近有效 token bucket（64/128/256/512）
+                # t5_attn=1 表示有效 token；取批次内最大实际长度再 round up
+                if getattr(args, "kv_trim", False):
+                    _actual = int(t5_attn.sum(dim=-1).max().item())
+                    _bucket = 512  # _actual > 512 时兜底（不裁，保持原行为）
+                    for _b in (64, 128, 256, 512):
+                        if _b >= _actual:
+                            _bucket = _b
+                            break
+                    cross = cross[:, :_bucket, :].contiguous()
 
             # Flow Matching
-            t = sample_t(bs, device)
+            t = sample_t(
+                bs, device,
+                mode=str(getattr(args, "timestep_sampling", "logit_normal") or "logit_normal"),
+                shift=float(getattr(args, "timestep_shift", 3.0) or 3.0),
+            )
             t_exp = t.view(-1, 1, 1, 1, 1)
-            noise = torch.randn_like(latents)
+            noise = make_noise(
+                latents,
+                noise_offset=float(getattr(args, "noise_offset", 0.0) or 0.0),
+                pyramid_iters=int(getattr(args, "pyramid_noise_iters", 0) or 0),
+                pyramid_discount=float(getattr(args, "pyramid_noise_discount", 0.35) or 0.35),
+            )
             noisy = (1 - t_exp) * latents + t_exp * noise
             target = noise - latents
 
@@ -2522,17 +2658,43 @@ def main():
                 if "loss_weight" in batch:
                     w = batch["loss_weight"].to(device).view(-1, *([1] * (loss_per_sample.dim() - 1)))
                     loss_per_sample = loss_per_sample * w
+                # timestep-dependent loss 权重
+                lw_scheme = str(getattr(args, "loss_weighting", "none") or "none")
+                if lw_scheme != "none":
+                    lw = compute_loss_weight(
+                        t,
+                        scheme=lw_scheme,
+                        min_snr_gamma=float(getattr(args, "min_snr_gamma", 5.0) or 5.0),
+                        weight_cap_ratio=float(getattr(args, "weight_cap_ratio", 0.0) or 0.0),
+                    ).to(device=device, dtype=torch.float32)
+                    loss_per_sample = loss_per_sample * lw.view(-1, *([1] * (loss_per_sample.dim() - 1)))
                 loss = loss_per_sample.mean()
+
+            # NaN 检测：forward 出 NaN 时跳过本 micro-batch
+            if not torch.isfinite(loss):
+                logger.warning(f"step {global_step} micro-batch {batch_idx}: loss={loss.item():.4g}，跳过")
+                optimizer.zero_grad()
+                continue
 
             # 反向传播
             loss = loss / args.grad_accum
             loss.backward()
 
             if (batch_idx + 1) % args.grad_accum == 0:
+                # NaN 梯度检测：跳过本次 update，清零继续
+                has_nan_grad = any(
+                    p.grad is not None and not torch.isfinite(p.grad).all()
+                    for p in trainable_params
+                )
+                if has_nan_grad:
+                    logger.warning(f"step {global_step}: 梯度含 NaN/Inf，跳过 optimizer.step()")
+                    optimizer.zero_grad()
+                    continue
+
                 if grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=grad_clip)
                 optimizer.step()
-                if scheduler is not None:
+                if scheduler is not None and optimizer_type != "prodigy_plus_schedulefree":
                     scheduler.step()
                 optimizer.zero_grad()
                 global_step += 1
