@@ -183,10 +183,17 @@ export default function ProjectOverview() {
 
   useEffect(() => {
     let cancelled = false
-    void api.listQueue()
+    // 只拉 done generate task（测试出图）：
+    //  - status='done' 让后端 db.list_tasks 直接过滤，避免老用户队列上千条全量传
+    //  - includeGenerate=true 因为 /api/queue 默认隐藏 generate；"查看输出" 链
+    //    向的就是 generate sample 目录，train task 的 .safetensors 用版本卡片
+    //    自带 ✓ 已训练 / 激活并打开 走另一条路径，不混在 "查看输出" 按钮里
+    void api.listQueue('done', { includeGenerate: true })
       .then((items) => {
         if (cancelled) return
-        setRelatedTasks(items.filter((t) => t.project_id === project.id))
+        setRelatedTasks(items.filter(
+          (t) => t.project_id === project.id && t.config_name === 'generate',
+        ))
       })
       .catch(() => {
         if (!cancelled) setRelatedTasks([])
@@ -241,8 +248,12 @@ export default function ProjectOverview() {
 
   const latestOutputTaskByVersion = useMemo(() => {
     const out = new Map<number, Task>()
-    for (const task of [...relatedTasks].sort((a, b) => b.id - a.id)) {
-      if (task.status !== 'done' || task.version_id == null) continue
+    // finished_at 排比 id 排准确：priority 调度 / retry 会让 id 顺序 ≠ 完成顺序。
+    const byFinished = [...relatedTasks].sort(
+      (a, b) => (b.finished_at ?? 0) - (a.finished_at ?? 0),
+    )
+    for (const task of byFinished) {
+      if (task.version_id == null) continue
       if (!out.has(task.version_id)) out.set(task.version_id, task)
     }
     return out

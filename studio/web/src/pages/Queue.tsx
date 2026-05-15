@@ -165,17 +165,22 @@ export default function QueuePage() {
 
   const hasRunning = useMemo(() => tasks.some(t => t.status === 'running'), [tasks])
 
-  const pauseRunning = async () => {
+  // 后端只有 per-task cancel，没有 queue-level pause。"暂停" 语义会让用户误以为
+  // 可以恢复，但 cancelTask 是 terminal cancel（task 进 canceled 状态，重启从 0
+  // 开始）；用 "取消" 语义对齐 QueueDetail 的 cancel 按钮。
+  // 复用 CLI Ctrl+C 那套 save state / --resume-state 链路的 "真暂停" 是独立 feature
+  // （见 memory/queue_pause_resume_via_sigint.md）。
+  const cancelRunning = async () => {
     if (!runningTask) return
     const ok = await confirm(
-      `暂停当前任务 #${runningTask.id}？会向后台发送取消信号，任务会在安全点停止。`,
-      { tone: 'warn', okText: '暂停任务' },
+      `取消当前任务 #${runningTask.id}？任务会在安全点停止，且无法恢复（重启训练会从 0 开始）。`,
+      { tone: 'warn', okText: '取消任务' },
     )
     if (!ok) return
     setBusy(true)
     try {
       await api.cancelTask(runningTask.id)
-      toast('已发送暂停信号', 'success')
+      toast('已发送取消信号', 'success')
       await reload()
     } catch (e) {
       toast(String(e), 'error')
@@ -194,12 +199,12 @@ export default function QueuePage() {
           <button onClick={clearDone} disabled={busy} className="btn btn-ghost btn-sm">清理已完成</button>
           {hasRunning && (
             <button
-              onClick={() => void pauseRunning()}
+              onClick={() => void cancelRunning()}
               disabled={busy || !runningTask}
               className="btn btn-secondary btn-sm text-warn border-warn"
               title="发送取消信号，让当前运行任务停止"
             >
-              暂停当前任务
+              取消当前任务
             </button>
           )}
           <button

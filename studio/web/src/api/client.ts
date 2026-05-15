@@ -1507,8 +1507,13 @@ export const api = {
   },
 
   // Queue --------------------------------------------------------------
-  listQueue: (status?: TaskStatus) => {
-    const qs = status ? `?status=${status}` : ''
+  listQueue: (status?: TaskStatus, opts?: { includeGenerate?: boolean }) => {
+    const params: string[] = []
+    if (status) params.push(`status=${status}`)
+    // /api/queue 默认隐藏 generate（测试出图）task，列表里不混淆 train slot；
+    // 想看 generate 任务（如 Overview 的 "查看输出"）显式开关。
+    if (opts?.includeGenerate) params.push('include_generate=true')
+    const qs = params.length ? `?${params.join('&')}` : ''
     return req<{ items: Task[] }>(`/api/queue${qs}`).then((r) => r.items)
   },
   getTask: (id: number) => req<Task>(`/api/queue/${id}`),
