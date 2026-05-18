@@ -617,7 +617,7 @@
     "downloadSource": "Download source",
     "downloadSourceHelp": "ModelScope is faster for users in China; unmapped models fall back to HuggingFace automatically.",
     "hfTokenHelp": "For HF private repo authentication. Public repos (including SmilingWolf WD14 / cella110n CLTagger) do not need it.",
-    "hfEndpointHelp": "Model download endpoint. hf-mirror is recommended in China; official source overseas.",
+    "hfEndpointHelp": "Model download endpoint. Defaults to HuggingFace official. Pick \"Custom URL\" to paste a mirror / self-hosted reverse proxy.",
     "modelscopeTokenHelp": "Public models do not need it; private repos or rate limits may require it.",
     "modelscopeInstallHelp": "Install the CLI first with <code>pip install modelscope</code> before use.",
     "allowGpuDuringTrain": "Allow GPU tasks while training",
@@ -692,8 +692,8 @@
     "onnxRestartRequired": "A new onnxruntime package is installed, but the current process is still using the old one. <strong>Restart Studio</strong> to apply EP changes.",
     "saveFailedWithError": "Save failed: {{error}}",
     "hfMirrorHint": "Recommended in China",
-    "hfOfficialHint": "Official source",
-    "hfCustomHint": "Custom mirror",
+    "hfOfficialHint": "Official source (default)",
+    "hfCustomHint": "Paste self-hosted proxy / sjtug / Tencent mirror, etc.",
     "modelDescriptions": {
       "animaMain": "Cosmos transformer (~4 GB)",
       "animaVae": "qwen_image_vae (~250 MB)",
@@ -1454,7 +1454,16 @@
     "noRegImages": "No reg images",
     "effectiveSamples": "Effective samples/epoch",
     "totalSteps": "Total steps",
-    "maxStepsLabel": "max_steps cap {{n}}"
+    "maxStepsLabel": "max_steps cap {{n}}",
+    "confirmReset": "Reset config to preset {{name}}? All customizations on the current version will be lost.",
+    "resetOkText": "Reset",
+    "resetSuccess": "Reset to preset {{name}} config",
+    "pickerTitleConfigured": "Current version has its own config; click to pick a preset as a starting point to reset",
+    "pickerTitleEmpty": "Click to pick a preset as a starting point and create the current version's config",
+    "configChip": "config",
+    "scopedConfigLabel": "{{title}} / {{label}} config",
+    "notConfiguredLabel": "Not configured — pick a preset to start",
+    "readPresetParams": "Read params from this preset"
   },
   "reg": {
     "loadFailed": "Failed to load reg status: {{error}}",

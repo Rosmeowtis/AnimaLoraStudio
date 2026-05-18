@@ -617,7 +617,7 @@
     "downloadSource": "下载源",
     "downloadSourceHelp": "魔搭（ModelScope）对国内用户更快；无映射的模型自动回退 HuggingFace。",
     "hfTokenHelp": "用于 HF 私有 repo 鉴权。公开仓库（含 SmilingWolf WD14 / cella110n CLTagger）不用填。",
-    "hfEndpointHelp": "模型下载端点。国内推荐 hf-mirror，海外推荐官方源。",
+    "hfEndpointHelp": "模型下载端点。默认 HuggingFace 官方源。需要镜像 / 自建反代时选「自定义 URL」粘贴。",
     "modelscopeTokenHelp": "公开模型不用填；私有仓库或限速时需要。",
     "modelscopeInstallHelp": "使用前请先 <code>pip install modelscope</code> 安装命令行工具。",
     "allowGpuDuringTrain": "允许 GPU 任务与训练并行",
@@ -692,8 +692,8 @@
     "onnxRestartRequired": "已装新 onnxruntime 包，但当前进程仍在用旧的。<strong>请重启 Studio</strong> 让 EP 切换生效。",
     "saveFailedWithError": "保存失败: {{error}}",
     "hfMirrorHint": "国内推荐",
-    "hfOfficialHint": "官方源",
-    "hfCustomHint": "自定义镜像",
+    "hfOfficialHint": "官方源（默认）",
+    "hfCustomHint": "粘贴自建反代 / sjtug / 腾讯镜像等",
     "modelDescriptions": {
       "animaMain": "Cosmos transformer（约 4 GB）",
       "animaVae": "qwen_image_vae（约 250 MB）",
@@ -1454,7 +1454,16 @@
     "noRegImages": "无正则图",
     "effectiveSamples": "有效样本/epoch",
     "totalSteps": "总步数",
-    "maxStepsLabel": "max_steps 上限 {{n}}"
+    "maxStepsLabel": "max_steps 上限 {{n}}",
+    "confirmReset": "重置为预设 {{name}} 的配置？当前 version 的所有自定义内容会丢失。",
+    "resetOkText": "重置",
+    "resetSuccess": "已重置为预设 {{name}} 的配置",
+    "pickerTitleConfigured": "当前 version 私有配置；点击展开选预设作为起点重置",
+    "pickerTitleEmpty": "点击选预设作为起点创建当前 version 配置",
+    "configChip": "配置",
+    "scopedConfigLabel": "{{title}} / {{label}} 配置",
+    "notConfiguredLabel": "未配置 — 选预设作为起点",
+    "readPresetParams": "读取此预设参数"
   },
   "reg": {
     "loadFailed": "加载 reg 状态失败: {{error}}",
