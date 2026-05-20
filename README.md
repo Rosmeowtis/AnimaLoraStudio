@@ -1,6 +1,6 @@
 # AnimaLoraStudio
 
-[![Version](https://img.shields.io/badge/version-0.8.3-blue)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-0.9.0-blue)](CHANGELOG.md)
 
 **端到端流水线**：从 Booru 抓图 → 筛选 → 打标 → 正则集 → 训练 → 出图测试，全流程在一个浏览器面板里推进。专为 [Anima](https://huggingface.co/circlestone-labs/Anima)（Cosmos DiT 二次元特调）训练优化。
 
@@ -17,7 +17,9 @@
 - **🧩 训练栈可扩展**（v0.7 新）— `runtime/training/` 子包 + 4 个 plugin registry（adapters / optimizers / schedulers / inference_samplers）+ `AdapterProtocol` hook（on_step_begin / regularization_loss / excludes_weight_decay）；加新变体走 3 步（写 build 函数 + 字典加行 + schema Literal）不动 phases / loop（详见 [ADR 0003](docs/adr/0003-anima-train-refactor.md) + [`runtime/training/README.md`](runtime/training/README.md)）
 - **🖼️ 图片预处理流水线**（v0.8 新）— 流水线插入「② 预处理」step：ESRGAN / Real-ESRGAN 等多放大器预设 + ModelScope/HF 双源、智能流水（大图直接 resize 跳过放大模型）、SSE 实时进度。单 manifest 单 grid + 状态徽章（详见 [ADR 0004](docs/adr/0004-preprocess-manifest.md)）
 - **🎲 InfoNoise 自适应训练**（v0.8 新）— 基于 I-MMSE 等价的反 CDF 时间步采样器，把抽样集中在信息量大的噪声窗口；走 `timestep_samplers/` plugin registry，默认关，存量训练零侵入
-- **⏸️ 暂停 / 恢复训练 + 队列挂起**（v0.9 新）— UI 上一键暂停 running task（保 optimizer / step / monitor state + config snapshot），日后点恢复从同一步接续训练；队列挂起开关让 dispatcher 不拉新 pending，过夜 / 维护场景顺手用（详见 [ADR 0006](docs/adr/0006-queue-pause-resume.md)）
+- **⏸️ 暂停 / 恢复训练 + 队列挂起**（v0.9 新）— UI 上一键暂停 running task（保 LoRA "interrupted" + config snapshot freeze args），日后点恢复从最近 epoch 末 auto-backup 接续训练；队列挂起开关让 dispatcher 不拉新 pending，过夜 / 维护场景顺手用（详见 [ADR 0006](docs/adr/0006-queue-pause-resume.md) 含 Addendum 1 设计翻盘）
+- **🎯 caption 触发词自动写入**（v0.9 新）— Step 4 打标顶部填 trigger_word，落库 → tag worker 把 trigger 作为第一个 tag 注入每张 caption + 训练 runtime 自动注入 sample_prompt；终结「忘记加触发词导致白训」footgun
+- **🌍 前端中英双语**（v0.9 新）— 全前端 i18n（含 schema-driven label / description / disable hint）+ 首启语言选择 modal；Settings → 显示 → 语言 后续切换
 
 ![Studio 训练页](docs/images/studio-train.png)
 
@@ -33,7 +35,7 @@
 1. **下载** — Booru 抓取（Gelbooru / Danbooru，凭据进 Settings）+ 本地 jpg/png/zip 上传
 2. **预处理**（v0.8 新，可选）— 图片放大流水线：ESRGAN / Real-ESRGAN 等预设 + ModelScope/HF 双源 + SSE 实时进度
 3. **筛选** — download / train 双面板，多选复制 / 移除，子文件夹管理
-4. **打标** — WD14 / **CLTagger**（v0.5 新，本地 ONNX）/ LLM（OpenAI compatible，含 JoyCaption / OpenAI / Anthropic 等 preset）三选；GPU EP 自动 fallback
+4. **打标** — WD14 / **CLTagger**（v0.5 新，本地 ONNX）/ LLM（OpenAI compatible，含 JoyCaption / OpenAI / Anthropic 等 preset）三选；GPU EP 自动 fallback；顶部 **trigger_word** 输入（v0.9 新）启动后自动作为第一个 tag 写入每张 caption
 5. **标签编辑** — 缓存模式 + 还原点，批量加 / 删 / 替换；批量范围支持「当前筛选」（v0.8 新）
 6. **正则集**（可选）— Booru 反向搜（自动 WD14 打标 + AR 聚类）/ **AI 先验生成**（v0.5 新，无 LoRA）
 7. **训练** — preset 双向流，入队即开始；config 编辑 600ms debounce 自动落盘；Simple / Advanced 模式（v0.8 新）
@@ -246,7 +248,7 @@ AnimaLoraStudio/
 
 ## 版本
 
-当前版本 **0.8.3**（见 [CHANGELOG.md](CHANGELOG.md)）。
+当前版本 **0.9.0**（见 [CHANGELOG.md](CHANGELOG.md)）。
 
 版本号唯一来源是 `studio/__init__.py:__version__`：
 
