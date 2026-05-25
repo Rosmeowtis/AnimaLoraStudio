@@ -120,10 +120,11 @@ def list_pending(p: dict[str, Any]) -> list[dict[str, Any]]:
         preprocess_manifest.entry_origin(entry, name)
         for name, entry in processed.items()
     }
+    removed_origins = preprocess_manifest.duplicate_removed_origins(pdir)
 
     items: list[dict[str, Any]] = []
     for f in _download_images(download):
-        if f.name in processed_origins:
+        if f.name in processed_origins or f.name in removed_origins:
             continue
         st = f.stat()
         w: Optional[int] = None
@@ -228,8 +229,10 @@ def summary(p: dict[str, Any]) -> dict[str, Any]:
         preprocess_manifest.entry_origin(entry, name)
         for name, entry in processed.items()
     }
+    removed_origins = preprocess_manifest.duplicate_removed_origins(pdir)
     n_pending = sum(
-        1 for f in _download_images(download) if f.name not in processed_origins
+        1 for f in _download_images(download)
+        if f.name not in processed_origins and f.name not in removed_origins
     )
     return {"image_count": n_pending + len(processed)}
 
@@ -355,6 +358,7 @@ def list_crop_workspace(p: dict[str, Any]) -> list[dict[str, Any]]:
     pdir = project_root(p)
     preprocess_manifest.ensure_manifest(pdir)
     processed = preprocess_manifest.all_processed(pdir)
+    removed_origins = preprocess_manifest.duplicate_removed_origins(pdir)
 
     items: list[dict[str, Any]] = []
     seen_origins: set[str] = set()
@@ -386,7 +390,7 @@ def list_crop_workspace(p: dict[str, Any]) -> list[dict[str, Any]]:
     # 未处理（download/ 里没在 manifest 中追溯到的）
     if download.exists():
         for f in sorted(_download_images(download)):
-            if f.name in seen_origins:
+            if f.name in seen_origins or f.name in removed_origins:
                 continue
             try:
                 with Image.open(f) as im:
