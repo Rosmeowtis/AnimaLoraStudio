@@ -3182,6 +3182,16 @@ def get_daemon_status() -> dict[str, Any]:
     }
 
 
+@app.get("/api/generate/daemon/logs")
+def get_daemon_logs(since_seq: int = 0, limit: int = 2000) -> dict[str, Any]:
+    """读 daemon stderr ring buffer。前端日志抽屉打开时拉历史；增量靠 SSE。
+
+    since_seq>0 时只返新于该 seq 的行。
+    """
+    from .services.inference_daemon import get_daemon
+    return get_daemon().read_logs(since_seq=since_seq, limit=limit)
+
+
 @app.post("/api/generate/daemon/unload")
 def unload_daemon() -> dict[str, Any]:
     """手动卸载 daemon 模型（释放 VRAM）。busy 时拒绝（409）。
