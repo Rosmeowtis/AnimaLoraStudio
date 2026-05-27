@@ -70,7 +70,10 @@ export default function GeneratePage() {
   const setLoras = (loras: LoraEntry[]) => setPrefs((p) => ({ ...p, loras }))
 
   // LoRA 预填 via URL query (?lora=<path>&projectId=N&versionId=N)
-  // Overview StatusBanner "在测试中加载" CTA 跳进来时，把 LoRA 直接塞入 loras。
+  // Overview StatusBanner "在测试中加载" CTA 跳进来时，URL 是显式 "测这条 LoRA"
+  // 意图——丢掉缓存 list 直接 replace 成 [urlLora]，避免旧/已删 LoRA 与新条目
+  // 并排出现（旧 append 行为会让 xDraft.loraIndex 指向脏 slot，submit 抛
+  // axisLoraMissing）。同时 clamp xDraft/yDraft.loraIndex 到合法范围。
   // 用 history.replaceState 清掉 query 避免刷新时重复触发。
   useEffect(() => {
     const sp = new URLSearchParams(window.location.search)
@@ -79,17 +82,25 @@ export default function GeneratePage() {
     const projectId = sp.get('projectId')
     const versionId = sp.get('versionId')
     setPrefs((p) => {
-      if (p.loras.some((l) => l.path === lora)) return p
+      const newLoras: LoraEntry[] = [{
+        path: lora,
+        scale: 1.0,
+        project_id: projectId ? Number(projectId) : null,
+        version_id: versionId ? Number(versionId) : null,
+      }]
+      const clamp = (d: XYAxisDraft | null): XYAxisDraft | null => {
+        if (!d || d.loraIndex == null) return d
+        if (d.loraIndex < newLoras.length) return d
+        return { ...d, loraIndex: 0 }
+      }
       return {
         ...p,
-        loras: [...p.loras, {
-          path: lora,
-          scale: 1.0,
-          project_id: projectId ? Number(projectId) : null,
-          version_id: versionId ? Number(versionId) : null,
-        }],
+        loras: newLoras,
+        xDraft: clamp(p.xDraft) ?? p.xDraft,
+        yDraft: clamp(p.yDraft),
       }
     })
+    setUrlConsumedKey((k) => k + 1)
     const url = new URL(window.location.href)
     url.searchParams.delete('lora')
     url.searchParams.delete('projectId')
@@ -112,6 +123,11 @@ export default function GeneratePage() {
   // 没法重试也没法取消（status=failed 时 cancelable=false）
   const [submitting, setSubmitting] = useState(false)
   const [currentTask, setCurrentTask] = useState<Task | null>(null)
+  // URL ?lora= 消费计数：bump 一次让 SidebarLoras 整块 remount，强制内部
+  // InlineLoraPicker 用新 value 重新初始化 pid/vid（picker 内 useState 只
+  // 一次性从 props.value 取 projectId/versionId，后续 props 变化不会同步，
+  // 不 remount 就会看到下拉 / chip 还卡在旧缓存项目）。
+  const [urlConsumedKey, setUrlConsumedKey] = useState(0)
   // monitor 走 useMonitorProgress hook (PR #37 增量协议)：currentTask 变 →
   // hook 自动重拉快照 + 订阅 SSE delta 合并；本组件只用 samples 字段，其余
   // 字段在这页生成场景下不需要。
@@ -418,12 +434,18 @@ export default function GeneratePage() {
                   <h3 className="m-0 text-md font-semibold">LoRA</h3>
                   <span className="text-xs text-fg-tertiary">{t('generate.loraHint')}</span>
                 </div>
-                <SidebarLoras loras={loras} onChange={setLoras} projectLoras={projectLoras} />
+                <SidebarLoras
+                  key={`single-${urlConsumedKey}`}
+                  loras={loras}
+                  onChange={setLoras}
+                  projectLoras={projectLoras}
+                />
               </div>
             )}
 
             {mode === 'xy' && (
               <SidebarXYAxes
+                key={`xy-${urlConsumedKey}`}
                 xDraft={xDraft}
                 yDraft={yDraft}
                 onXChange={setXDraft}
