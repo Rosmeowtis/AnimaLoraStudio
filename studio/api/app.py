@@ -34,6 +34,11 @@ from .routers import (
     tagger,
     upscalers,
 )
+from .routers.projects import crud as projects_crud
+from .routers.projects import exports as projects_exports
+from .routers.projects import curation as projects_curation
+from .routers.projects import ingestion as projects_ingestion
+from .routers.projects import training as projects_training
 from .routers.queue import io as queue_io_router
 from .routers.queue import lifecycle as queue_lifecycle
 from .routers.queue import outputs as queue_outputs
@@ -71,3 +76,14 @@ app.include_router(generate.router)
 app.include_router(queue_io_router.router)
 app.include_router(queue_lifecycle.router)
 app.include_router(queue_outputs.router)
+# PR-6.5 commit 1: projects/versions CRUD 子包第一刀（16 routes）
+app.include_router(projects_crud.router)
+# PR-6.5 commit 2: train.zip / bundle.zip / export-bundle / import-bundle (path/upload) /
+# import-train（6 routes）
+app.include_router(projects_exports.router)
+# PR-6.5 commit 3: download/upload + preprocess (14 routes)
+app.include_router(projects_ingestion.router)
+# PR-6.5 commit 4: files/thumb + curation + duplicates (12 routes)
+app.include_router(projects_curation.router)
+# PR-6.5 commit 5: tag + captions + reg + reg_ai + version_config + queue training + version_thumb (23 routes)
+app.include_router(projects_training.router)
