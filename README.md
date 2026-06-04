@@ -27,7 +27,7 @@
 - **Loss 函数**：MSE / Huber，可配置权重曲线（min_snr / cosmap / detail_inv_t 等）
 - **Timestep 采样**：uniform / logit_normal / mode / mixed_uniform 等，含可配置 schedule shift
 - **InfoNoise 自适应采样（可选）**：基于 I-MMSE 的反 CDF 时间步采样器
-- **优化器**：AdamW / Prodigy / Prodigy+ScheduleFree
+- **优化器**：AdamW / Lion / Automagic / Prodigy / Prodigy+ScheduleFree（推荐起点 / 切换换算见 [`docs/user-guide/optimizers.md`](docs/user-guide/optimizers.md)）
 - **Adapter**：LoRA + LyCORIS LoKr（走 [lycoris-lora](https://github.com/KohakuBlueleaf/LyCORIS) 官方库，含 DoRA / rs-LoRA / dropout）
 - **分层 rank**：`lora_rank_rules` 按层名正则配不同 rank，便于按模块重要性差异化分配参数预算
 - **Attention backend**：xformers / flash_attn / PyTorch SDPA
@@ -68,11 +68,6 @@
 - 暗色 / 日间模式与字号密度切换
 
 ---
-
-## 上游与致谢
-
-- 核心训练脚本派生自 [**Moeblack/AnimaLoraToolkit**](https://github.com/Moeblack/AnimaLoraToolkit)。
-- 主模型 / VAE：[circlestone-labs / Anima](https://huggingface.co/circlestone-labs/Anima)
 
 ---
 
@@ -170,8 +165,8 @@ AnimaLoraStudio/
 │   ├── anima_train.py             # 训练入口
 │   ├── training/                  # 训练栈子包：context / phases / loop / sample_runner
 │   │   ├── adapters/              # plugin: lokr / loha / lora
-│   │   ├── optimizers/            # plugin: adamw / prodigy / prodigy_plus_schedulefree
-│   │   ├── schedulers/            # plugin: cosine / cosine_with_restart / none
+│   │   ├── optimizers/            # plugin: adamw / lion / automagic / prodigy / prodigy_plus_schedulefree
+│   │   ├── schedulers/            # plugin: cosine / cosine_with_restart / cosine_with_warmup / none
 │   │   ├── inference_samplers/    # plugin: er_sde 等
 │   │   └── phases/                # bootstrap / models / dataset / optimizer / resume / finalize
 │   ├── anima_generate.py          # 出图：单图 / XY 矩阵
@@ -269,6 +264,15 @@ AnimaLoraStudio/
 - **GPU**：NVIDIA，**16 GB+ 显存推荐**（RTX 4060Ti 16G / 4070Ti / 4080 / 5070+ / 3090 / 4090 / 5090 等）；**8 GB 极限可跑**（部分笔记本 GPU 实测可行，需关 sample 输出 + 减小 batch / 分辨率，且训练速度明显下降）。系统 GPU 占用低，VRAM 主要给训练；A 卡 / Apple Silicon 不支持
 - **RAM**：16 GB+
 - **存储**：SSD 强烈推荐（latent cache + sample 输出 IO 频繁）
+
+---
+
+## 上游与致谢
+
+- 核心训练脚本派生自 [**Moeblack/AnimaLoraToolkit**](https://github.com/Moeblack/AnimaLoraToolkit)
+- 主模型 / VAE：[circlestone-labs / Anima](https://huggingface.co/circlestone-labs/Anima)
+
+完整的第三方算法 / 代码 / 论文出处见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
 ---
 

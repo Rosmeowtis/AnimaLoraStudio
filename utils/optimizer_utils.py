@@ -7,6 +7,10 @@ Optimizer Utils Module - 优化器创建
 3. Prodigy (prodigyopt) - 无需调 lr 的自适应优化器
 4. ProdigyPlusScheduleFree (prodigy-plus-schedule-free) - Schedule-Free + Prodigy，
    解决 Prodigy 在扩散 LoRA 训练中的 mutation ep / 风格突变问题。
+5. Lion - EvoLved Sign Momentum (Chen et al., 2023, arxiv 2302.06675)
+6. Automagic - Per-parameter adaptive lr via sign-agreement tracking
+   原作者: Ostris (https://github.com/ostris/ai-toolkit, MIT license, Copyright (c)
+   2024 Ostris, LLC). bf16 Kahan summation path 借鉴自 tdrussell/diffusion-pipe.
 """
 
 from __future__ import annotations
@@ -28,6 +32,11 @@ try:
     BITSANDBYTES_AVAILABLE = True
 except ImportError:
     BITSANDBYTES_AVAILABLE = False
+
+try:
+    from optimum.quanto import QBytesTensor
+except ImportError:
+    QBytesTensor = ()
 
 
 def _is_param_groups(params: Any) -> bool:
@@ -160,6 +169,23 @@ def create_optimizer(
             **kwargs
         )
 
+    elif optimizer_type == "lion":
+        return create_lion(
+            params=params,
+            lr=learning_rate,
+            betas=betas,
+            weight_decay=weight_decay,
+            **kwargs,
+        )
+
+    elif optimizer_type == "automagic":
+        return create_automagic(
+            params=params,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+            **kwargs,
+        )
+
     elif optimizer_type == "prodigy_plus_schedulefree":
         return create_prodigy_plus_schedulefree(
             params=params,
@@ -173,7 +199,7 @@ def create_optimizer(
     else:
         raise ValueError(
             f"Unknown optimizer type: {optimizer_type}. "
-            f"Choose from: adamw, adamw8bit, prodigy, prodigy_plus_schedulefree"
+            f"Choose from: adamw, automagic, lion, prodigy, prodigy_plus_schedulefree"
         )
 
 
@@ -294,6 +320,452 @@ def create_standard_adamw(
     
     print("  [OK] AdamW optimizer created")
 
+    return optimizer
+
+
+# ============================================================================
+# Automagic optimizer + Auto8bitTensor helper
+#
+# Adapted from ostris/ai-toolkit (https://github.com/ostris/ai-toolkit), which
+# also flowed through tdrussell/diffusion-pipe (added Kahan summation for
+# bfloat16). The core sign-agreement schedule, 8-bit lr_mask, Adafactor-style
+# factored 2nd moment, and stochastic-rounding helpers below are Ostris's
+# design. We re-implement on top of the upstream structure and align with
+# diffusion-pipe's bf16 Kahan path.
+#
+# MIT License — Copyright (c) 2024 Ostris, LLC
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in
+# all copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+# ============================================================================
+
+
+class Auto8bitTensor:
+    def __init__(self, data: torch.Tensor | dict[str, Any]) -> None:
+        if isinstance(data, dict):
+            self.quantized = data["quantized"]
+            self.scale = data["scale"]
+            self.orig_dtype = data["orig_dtype"]
+            return
+        abs_max = data.abs().max().item()
+        self.scale = abs_max / 127.0 if abs_max > 0 else 1.0
+        self.quantized = (data / self.scale).round().clamp(-127, 127).to(torch.int8)
+        self.orig_dtype = data.dtype
+
+    def dequantize(self) -> torch.Tensor:
+        return self.quantized.to(dtype=torch.float32) * self.scale
+
+    def to(self, *args, **kwargs):
+        return self.dequantize().to(*args, **kwargs)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "quantized": self.quantized,
+            "scale": self.scale,
+            "orig_dtype": self.orig_dtype,
+        }
+
+
+def _copy_stochastic_bf16(target: torch.Tensor, source: torch.Tensor) -> None:
+    result = torch.randint_like(source, dtype=torch.int32, low=0, high=(1 << 16))
+    result.add_(source.view(dtype=torch.int32))
+    result.bitwise_and_(-65536)
+    target.copy_(result.view(dtype=torch.float32))
+
+
+def _copy_stochastic(target: torch.Tensor, source: torch.Tensor) -> None:
+    if target.dtype == torch.float32:
+        target.copy_(source)
+        return
+    if target.dtype == torch.bfloat16:
+        _copy_stochastic_bf16(target, source)
+        return
+    target.copy_(source.to(target.dtype))
+
+
+# Note on stochastic-rounding grad accumulation:
+# Upstream (ostris/ai-toolkit, tdrussell/diffusion-pipe) registers a
+# post-accumulate-grad hook to do fp32 grad accumulation with stochastic
+# rounding. We deliberately do NOT enable that path because it silently
+# breaks two common training paths:
+#   1. torch.cuda.amp.GradScaler.unscale_ skips params where p.grad is None
+#      — the hook deletes p.grad after each backward, so unscale never runs
+#      and the optimizer would step on still-scaled gradients.
+#   2. torch.nn.utils.clip_grad_norm_ skips p.grad is None, so grad clipping
+#      becomes a no-op.
+# bf16 numerical stability is instead handled inside Automagic.step via
+# Kahan compensated summation (see `shift` buffer below). See upstream
+# diffusion-pipe optimizers/automagic.py:72-79 (commented out by author).
+
+
+class Automagic(Optimizer):
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-6,
+        min_lr: float = 1e-7,
+        max_lr: float = 1e-3,
+        lr_bump: float = 1e-6,
+        eps: float = 1e-30,
+        clip_threshold: float = 1.0,
+        beta2: float = 0.999,
+        weight_decay: float = 0.0,
+    ) -> None:
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if min_lr < 0.0:
+            raise ValueError(f"Invalid min_lr: {min_lr}")
+        if max_lr <= 0.0 or max_lr < min_lr:
+            raise ValueError(f"Invalid max_lr: {max_lr}")
+        if lr_bump < 0.0:
+            raise ValueError(f"Invalid lr_bump: {lr_bump}")
+        if not 0.0 <= beta2 < 1.0:
+            raise ValueError(f"Invalid beta2: {beta2}")
+        if clip_threshold <= 0.0:
+            raise ValueError(f"Invalid clip_threshold: {clip_threshold}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+
+        self.lr = min(lr, max_lr)
+        if lr > 1e-3:
+            logger.warning("Automagic start lr %s is high; clamping to 1e-6", lr)
+            self.lr = 1e-6
+        self.min_lr = min_lr
+        self.max_lr = max_lr
+        self.lr_bump = lr_bump
+        super().__init__(
+            params,
+            dict(
+                lr=self.lr,
+                eps=eps,
+                clip_threshold=clip_threshold,
+                beta2=beta2,
+                weight_decay=weight_decay,
+            ),
+        )
+        self.base_lrs = [self.lr for _ in self.param_groups]
+
+    @staticmethod
+    def _rms(tensor: torch.Tensor) -> torch.Tensor:
+        return tensor.norm(2) / (tensor.numel() ** 0.5)
+
+    @staticmethod
+    def _approx_sq_grad(exp_avg_sq_row: torch.Tensor, exp_avg_sq_col: torch.Tensor) -> torch.Tensor:
+        r_factor = (exp_avg_sq_row / exp_avg_sq_row.mean(dim=-1, keepdim=True)).rsqrt_().unsqueeze(-1)
+        c_factor = exp_avg_sq_col.unsqueeze(-2).rsqrt()
+        return torch.mul(r_factor, c_factor)
+
+    @staticmethod
+    def _get_lr(param_state: dict[str, Any]) -> float:
+        avg_lr = param_state.get("avg_lr")
+        if avg_lr is None:
+            return 0.0
+        if isinstance(avg_lr, torch.Tensor):
+            return float(avg_lr.detach().float().item())
+        return float(avg_lr)
+
+    def _get_group_lr(self, group: dict[str, Any]) -> float:
+        lrs = [self._get_lr(self.state[p]) for p in group["params"] if p in self.state]
+        if not lrs:
+            return self.lr
+        return sum(lrs) / len(lrs)
+
+    def get_learning_rates(self) -> list[float]:
+        lrs = [self._get_group_lr(group) for group in self.param_groups]
+        return lrs or self.base_lrs
+
+    def get_avg_learning_rate(self) -> float:
+        lrs = self.get_learning_rates()
+        return sum(lrs) / len(lrs)
+
+    def initialize_state(self, p: nn.Parameter) -> None:
+        state = self.state[p]
+        state["step"] = 0
+        if "lr_mask" not in state:
+            state["lr_mask"] = Auto8bitTensor(
+                torch.ones(p.shape, device=p.device, dtype=torch.float32) * self.lr
+            )
+        state["avg_lr"] = torch.mean(state["lr_mask"].to(torch.float32))
+        if "last_polarity" not in state:
+            state["last_polarity"] = torch.zeros(p.shape, dtype=torch.bool, device=p.device)
+        if len(p.shape) >= 2:
+            state["exp_avg_sq_row"] = torch.zeros(p.shape[:-1]).to(p)
+            state["exp_avg_sq_col"] = torch.zeros(p.shape[:-2] + p.shape[-1:]).to(p)
+        else:
+            state["exp_avg_sq"] = torch.zeros_like(p)
+        state["RMS"] = 0
+        # Kahan compensated summation for bf16 — keeps the rounded-off portion
+        # of each update so it can be applied on the next step. Aligns with
+        # upstream diffusion-pipe (optimizers/automagic.py:354-356).
+        if p.dtype == torch.bfloat16 and "shift" not in state:
+            state["shift"] = torch.zeros_like(p)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None or not p.requires_grad:
+                    continue
+                grad = p.grad
+                if grad.dtype != torch.float32:
+                    grad = grad.to(torch.float32)
+                if grad.is_sparse:
+                    raise RuntimeError("Automagic does not support sparse gradients")
+
+                state = self.state[p]
+                if len(state) == 0:
+                    self.initialize_state(p)
+                factored = len(grad.shape) >= 2
+                if factored:
+                    state.setdefault("exp_avg_sq_row", torch.zeros(p.shape[:-1]).to(grad))
+                    state.setdefault("exp_avg_sq_col", torch.zeros(p.shape[:-2] + p.shape[-1:]).to(grad))
+                    state["exp_avg_sq_row"] = state["exp_avg_sq_row"].to(grad)
+                    state["exp_avg_sq_col"] = state["exp_avg_sq_col"].to(grad)
+                else:
+                    state.setdefault("exp_avg_sq", torch.zeros_like(grad))
+                    state["exp_avg_sq"] = state["exp_avg_sq"].to(grad)
+
+                p_data_fp32 = p.dequantize() if QBytesTensor and isinstance(p, QBytesTensor) else p
+                if p.dtype != torch.float32:
+                    p_data_fp32 = p_data_fp32.clone().float()
+
+                state["step"] = state.get("step", 0) + 1
+                state["RMS"] = self._rms(p_data_fp32)
+                beta2 = group["beta2"]
+                eps = group["eps"]
+                update = (grad ** 2) + eps
+                if factored:
+                    exp_avg_sq_row = state["exp_avg_sq_row"]
+                    exp_avg_sq_col = state["exp_avg_sq_col"]
+                    exp_avg_sq_row.mul_(beta2).add_(update.mean(dim=-1), alpha=(1.0 - beta2))
+                    exp_avg_sq_col.mul_(beta2).add_(update.mean(dim=-2), alpha=(1.0 - beta2))
+                    update = self._approx_sq_grad(exp_avg_sq_row, exp_avg_sq_col)
+                    update.mul_(grad)
+                else:
+                    exp_avg_sq = state["exp_avg_sq"]
+                    exp_avg_sq.mul_(beta2).add_(update, alpha=(1.0 - beta2))
+                    update = exp_avg_sq.rsqrt().mul_(grad)
+
+                update.div_((self._rms(update) / group["clip_threshold"]).clamp_(min=1.0))
+
+                if "last_polarity" not in state or "lr_mask" not in state:
+                    self.initialize_state(p)
+                current_polarity = (update > 0).to(torch.bool)
+                sign_agreement = torch.where(state["last_polarity"] == current_polarity, 1, -1)
+                state["last_polarity"] = current_polarity
+                lr_mask = state["lr_mask"].to(torch.float32)
+                new_lr = torch.where(
+                    sign_agreement > 0,
+                    lr_mask + self.lr_bump,
+                    lr_mask - self.lr_bump,
+                )
+                new_lr = torch.clamp(new_lr, min=self.min_lr, max=self.max_lr)
+                update.mul_(new_lr)
+                state["lr_mask"] = Auto8bitTensor(new_lr)
+                state["avg_lr"] = torch.mean(new_lr)
+
+                if group["weight_decay"] != 0:
+                    weight_decay_update = p_data_fp32 * (-group["weight_decay"]) * new_lr
+                else:
+                    weight_decay_update = None
+
+                if p.dtype == torch.bfloat16:
+                    # Kahan compensated summation — matches upstream
+                    # diffusion-pipe (optimizers/automagic.py:308-318). Trades
+                    # one extra bf16 buffer (`state['shift']`) for unbiased,
+                    # zero-variance accumulation over long bf16 training; the
+                    # alternative stochastic-rounding path injects ~scale/2
+                    # noise per step into the lr_mask sign-agreement signal.
+                    update.mul_(-1)
+                    if weight_decay_update is not None:
+                        update.add_(weight_decay_update)
+                    shift = state.setdefault("shift", torch.zeros_like(p))
+                    shift.add_(update)
+                    # Use grad tensor as scratch buffer for the pre-update p,
+                    # so shift carries forward only the bf16 rounding error.
+                    grad.copy_(p.detach())
+                    p.add_(shift)
+                    shift.add_(grad.sub_(p))
+                else:
+                    if weight_decay_update is not None:
+                        p_data_fp32.add_(weight_decay_update)
+                    p_data_fp32.add_(-update)
+                    if p.dtype != torch.float32:
+                        _copy_stochastic(p, p_data_fp32)
+
+        return loss
+
+    def state_dict(self, *args, **kwargs):
+        state_dict = super().state_dict(*args, **kwargs)
+        state_dict["state"] = {
+            p: {
+                **{k: v for k, v in state.items() if k != "lr_mask"},
+                **({"lr_mask": state["lr_mask"].state_dict()} if "lr_mask" in state else {}),
+            }
+            for p, state in state_dict["state"].items()
+        }
+        return state_dict
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        converted = {
+            "state": {},
+            "param_groups": state_dict.get("param_groups", []),
+        }
+        for param_id, state in state_dict.get("state", {}).items():
+            converted_state = dict(state)
+            if isinstance(converted_state.get("lr_mask"), dict):
+                converted_state["lr_mask"] = Auto8bitTensor(converted_state["lr_mask"])
+            converted["state"][param_id] = converted_state
+        return super().load_state_dict(converted)
+
+
+def create_automagic(
+    params: Iterator[nn.Parameter],
+    lr: float,
+    min_lr: float = 1e-7,
+    max_lr: float = 1e-3,
+    lr_bump: float = 1e-6,
+    eps: float = 1e-30,
+    clip_threshold: float = 1.0,
+    beta2: float = 0.999,
+    weight_decay: float = 0.0,
+    **kwargs,
+) -> Optimizer:
+    # Automagic 上游推荐 init lr=1e-6（每参数自适应起点）；> 1e-5 量级是 AdamW
+    # 风格 lr 误用，sign-agreement 调度需要很多 step 才能从过高起点收敛回工作区间。
+    # UI 切换 optimizer_type 时会自动改写 lr=1e-6；这里兜底 saved config / CLI 路径。
+    if lr > 1e-5:
+        logger.warning(
+            "Automagic 初始 lr=%.2e 远高于推荐 1e-6；sign-agreement 自适应从过高起点"
+            "收敛慢，建议设为 1e-6（per-param lr 由 [min_lr, max_lr] 自动调）",
+            lr,
+        )
+    param_list = params if _is_param_groups(params) else list(params)
+    optimizer = Automagic(
+        param_list,
+        lr=lr,
+        min_lr=min_lr,
+        max_lr=max_lr,
+        lr_bump=lr_bump,
+        eps=eps,
+        clip_threshold=clip_threshold,
+        beta2=beta2,
+        weight_decay=weight_decay,
+        **kwargs,
+    )
+    print(
+        f"Creating Automagic optimizer (lr={lr}, min_lr={min_lr}, max_lr={max_lr}, "
+        f"lr_bump={lr_bump}, beta2={beta2}, weight_decay={weight_decay})"
+    )
+    print("  [OK] Automagic optimizer created")
+    return optimizer
+
+
+class Lion(Optimizer):
+    """EvoLved Sign Momentum optimizer (Chen et al., 2023).
+
+    Paper: "Symbolic Discovery of Optimization Algorithms"
+        https://arxiv.org/abs/2302.06675  (Google Brain)
+
+    Reference implementations:
+    - Google official:    https://github.com/google/automl/tree/master/lion
+    - Community PyTorch:  https://github.com/lucidrains/lion-pytorch
+
+    This is a minimal re-implementation aligning with the paper's Algorithm 1
+    and Google's reference; no dependency on `lion-pytorch`.
+    """
+
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-4,
+        betas: tuple[float, float] = (0.9, 0.99),
+        weight_decay: float = 0.0,
+    ) -> None:
+        if lr < 0.0:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta1: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta2: {betas[1]}")
+        if weight_decay < 0.0:
+            raise ValueError(f"Invalid weight_decay: {weight_decay}")
+        super().__init__(params, dict(lr=lr, betas=betas, weight_decay=weight_decay))
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            weight_decay = group["weight_decay"]
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+                grad = p.grad
+                if grad.is_sparse:
+                    raise RuntimeError("Lion does not support sparse gradients")
+
+                if weight_decay != 0.0:
+                    p.mul_(1 - lr * weight_decay)
+
+                state = self.state[p]
+                if len(state) == 0:
+                    state["exp_avg"] = torch.zeros_like(p)
+                exp_avg = state["exp_avg"]
+
+                update = exp_avg.mul(beta1).add(grad, alpha=1 - beta1)
+                p.add_(update.sign(), alpha=-lr)
+                exp_avg.mul_(beta2).add_(grad, alpha=1 - beta2)
+
+        return loss
+
+
+def create_lion(
+    params: Iterator[nn.Parameter],
+    lr: float,
+    betas: tuple = (0.9, 0.99),
+    weight_decay: float = 0.0,
+    **kwargs,
+) -> Optimizer:
+    # Lion 论文（Chen et al. 2023, arxiv 2302.06675 §4.3）经验：lr ≈ AdamW lr / 3，
+    # weight_decay 3-10× AdamW。从 AdamW 默认 lr=1e-4 直切 Lion 容易发散；这里在
+    # lr 落在 AdamW 量级（1e-4 及以上）时提示一下。详细见 docs/user-guide/optimizers.md。
+    if lr >= 1e-4:
+        logger.warning(
+            "Lion lr=%.2e 接近/高于 AdamW 量级；论文推荐 lr ≈ AdamW lr / 3 "
+            "（如 AdamW 1e-4 → Lion ~3e-5）。继续训练但可能发散，详见 "
+            "docs/user-guide/optimizers.md",
+            lr,
+        )
+    param_list = params if _is_param_groups(params) else list(params)
+    optimizer = Lion(param_list, lr=lr, betas=betas, weight_decay=weight_decay, **kwargs)
+    print(f"Creating Lion optimizer (lr={lr}, betas={betas}, weight_decay={weight_decay})")
+    print("  [OK] Lion optimizer created")
     return optimizer
 
 
@@ -614,6 +1086,8 @@ def get_optimizer_info(optimizer: Optimizer) -> Dict[str, Any]:
     # PPSF 内部 d 估计 — 调试时有用
     if "d" in pg0:
         info["d"] = pg0["d"]
+    if hasattr(optimizer, "get_avg_learning_rate") and callable(getattr(optimizer, "get_avg_learning_rate")):
+        info["learning_rate"] = optimizer.get_avg_learning_rate()
 
     return info
 
@@ -627,6 +1101,11 @@ def get_optimizer_monitor_metrics(optimizer: Optimizer) -> Dict[str, float]:
     normalizes those shapes into one monitor point while preserving the raw
     ingredients for debugging.
     """
+    if hasattr(optimizer, "get_avg_learning_rate") and callable(getattr(optimizer, "get_avg_learning_rate")):
+        avg_lr = _as_float(optimizer.get_avg_learning_rate())
+        if avg_lr is not None:
+            return {"lr": avg_lr, "actual_lr": avg_lr}
+
     groups = list(getattr(optimizer, "param_groups", []) or [])
     if not groups:
         return {"lr": 0.0}
