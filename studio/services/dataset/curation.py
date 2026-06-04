@@ -142,20 +142,18 @@ def list_train(
 ) -> dict[str, list[dict[str, Any]]]:
     """train 子文件夹 → `[{name, mtime, origin}, ...]`（按 origin 去重）。
 
-    ADR 0010 fixup（2026-06-04）：Curation 右侧 train 区显示"用户筛选时
-    选了哪些 download 原图"，跟预处理后状态解耦：
+    ADR 0010 fixup：Curation 右侧 train 区显示"用户筛选时选了哪些 download 原图"，
+    跟预处理后状态解耦：
 
     - 按 manifest entry.origin **去重**：multi-crop fan-out 派生（X_c0.png +
       X_c1.png 同 origin=X.jpg）只显示一条
-    - 不过滤 `duplicate_removed` entry：用户当时筛选选了它，时间上在预处理
-      之前，UI 该显示
-    - 扫 train manifest 而不是物理文件（fan-out 派生数量跟筛选语义无关）
-    - 返回 `name` 用 **origin**（download 文件名），跟 `copy_to_train` /
+    - 物理 iterdir 决定显示集合：duplicate_removed 物理已删 → 自然不出现
+      在 Curation；要查看 / 恢复走总览页"已删除"tab
+    - 返回 `name` 用 **origin**（download 文件名），跟 `copy_download_to_train` /
       `remove_from_train` 的 name 语义对齐到 download scope
 
-    `mtime` 用 manifest entry 的 mtime（物理产物 mtime；多派生取第一条）；
-    前端按时间排序仍稳定。老项目 fallback：ensure_train_manifest 重建后
-    走同一路径。
+    `mtime` 用物理文件 mtime；前端按时间排序仍稳定。老项目 fallback：
+    ensure_train_manifest 重建后走同一路径。
     """
     p, v, train = _version_train_dir(conn, project_id, version_id)
     if not train.exists():
@@ -169,7 +167,7 @@ def list_train(
     for sub in sorted(train.iterdir()):
         if not sub.is_dir():
             continue
-        # 物理目录决定显示集合（含 duplicate_removed 软删除的图：物理还在）+
+        # 物理目录决定显示集合（duplicate_removed 物理已删→不出现）+
         # 兼容老路径（copy_to_train 不写 manifest，但物理图能扫到）。manifest
         # 仅用于反查 origin → 按 origin 去重（multi-crop fan-out 折叠成一行）。
         items_by_origin: dict[str, dict[str, Any]] = {}
@@ -216,74 +214,6 @@ def curation_view(conn, project_id: int, version_id: int) -> dict[str, Any]:
 
 
 _META_EXTS = (".txt", ".json")
-
-
-def copy_to_train(
-    conn,
-    project_id: int,
-    version_id: int,
-    files: list[str],
-    dest_folder: str,
-) -> dict[str, list[str]]:
-    """从工作集复制选中文件到 train/{dest_folder}/，已存在跳过。
-
-    `files` 里每个 name 可能是两种：
-      1. **preprocess 派生名**（如 `X.png` 单 crop 或 `X_c0.png` multi-crop）—
-         前端 `list_download` 把派生展开过的行选中后传过来。manifest 有 entry
-         → 直接复制 `preprocess/{name}` 到 `train/{name}`。
-      2. **download 原图名**（如 `Y.jpg`）— 未处理的图。manifest 无 entry →
-         复制 `download/{name}` 到 `train/{name}`。
-
-    metadata（`.txt` / `.json`）始终从 download 目录拿（标签不会被预处理改写）：
-    多 crop 派生共享同一份原图 caption，复制到 train 下目标文件的 stem 上。
-    """
-    _validate_folder(dest_folder)
-    p, _, train = _version_train_dir(conn, project_id, version_id)
-    pdir = projects.project_dir(p["id"], p["slug"])
-    download_dir = pdir / "download"
-    preprocess_manifest.ensure_manifest(pdir)
-    dst_dir = train / dest_folder
-    dst_dir.mkdir(parents=True, exist_ok=True)
-
-    copied: list[str] = []
-    skipped: list[str] = []
-    missing: list[str] = []
-    for name in files:
-        _validate_filename(name)
-        entry = preprocess_manifest.get_entry(pdir, name)
-        if preprocess_manifest.is_duplicate_removed_entry(entry):
-            skipped.append(name)
-            continue
-        if entry is not None:
-            # preprocess 派生：bytes 在 preprocess/，metadata 在 download/{origin}.txt
-            src = pdir / "preprocess" / name
-            meta_stem = Path(
-                preprocess_manifest.entry_origin(entry, name)
-            ).stem
-        else:
-            # 未处理：bytes + metadata 都在 download/
-            src = download_dir / name
-            meta_stem = Path(name).stem
-
-        if not src.exists():
-            missing.append(name)
-            continue
-        dst = dst_dir / name
-        if dst.exists():
-            skipped.append(name)
-            continue
-        shutil.copy2(src, dst)
-        # metadata 按 download/{meta_stem}.{ext} 找，复制到 train/{dst.stem}.{ext}
-        dst_stem = Path(name).stem
-        for ext in _META_EXTS:
-            sm = download_dir / f"{meta_stem}{ext}"
-            if sm.exists():
-                try:
-                    shutil.copy2(sm, dst_dir / f"{dst_stem}{ext}")
-                except OSError:
-                    pass
-        copied.append(name)
-    return {"copied": copied, "skipped": skipped, "missing": missing}
 
 
 def copy_download_to_train(
