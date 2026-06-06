@@ -106,13 +106,27 @@ def test_parse_json_works_via_yaml_superset() -> None:
     assert suggested == "old"
 
 
-def test_parse_rejects_unknown_field() -> None:
+def test_parse_drops_unknown_field() -> None:
     import yaml
     bad = _payload()
     bad["nonexistent_field"] = 123
     raw = yaml.safe_dump(bad).encode("utf-8")
-    with pytest.raises(presets_io.PresetError, match="校验失败"):
-        presets_io.parse_preset_bytes(raw, "bad.yaml")
+    cfg, suggested = presets_io.parse_preset_bytes(raw, "bad.yaml")
+    assert suggested == "bad"
+    assert "nonexistent_field" not in cfg
+
+
+def test_parse_migrates_legacy_attention_fields() -> None:
+    import yaml
+    legacy = _payload()
+    legacy.pop("attention_backend", None)
+    legacy["flash_attn"] = False
+    legacy["xformers"] = True
+    raw = yaml.safe_dump(legacy).encode("utf-8")
+    cfg, _ = presets_io.parse_preset_bytes(raw, "legacy.yaml")
+    assert cfg["attention_backend"] == "xformers"
+    assert "flash_attn" not in cfg
+    assert "xformers" not in cfg
 
 
 def test_parse_rejects_non_mapping() -> None:
@@ -148,6 +162,63 @@ def test_preset_path_is_public_alias() -> None:
     assert presets_io.preset_path("foo").name == "foo.yaml"
     with pytest.raises(presets_io.PresetError, match="非法预设名"):
         presets_io.preset_path("bad/name")
+
+
+# ---------------------------------------------------------------------------
+# InfoNoise 老 config 互斥兼容：_tolerant_validate 自动关 InfoNoise 保住用户原值
+# ---------------------------------------------------------------------------
+
+
+def test_tolerant_validate_infonoise_mutex_disables_infonoise() -> None:
+    """老 yaml 同时 infonoise=on + 4 互斥字段任一非默认 → 自动关 InfoNoise
+    保留用户原投入字段，"infonoise_enabled" 进 defaulted_fields 让前端 banner。
+    """
+    cases = [
+        {"infonoise_enabled": True, "noise_enhancement_type": "offset"},
+        {"infonoise_enabled": True, "loss_weighting": "detail_inv_t"},
+        {"infonoise_enabled": True, "loss_type": "huber"},
+        {"infonoise_enabled": True, "timestep_schedule_shift": 2.0},
+    ]
+    for overrides in cases:
+        cfg, _, defaulted = presets_io._tolerant_validate(overrides)
+        assert cfg.infonoise_enabled is False, overrides
+        assert "infonoise_enabled" in defaulted, overrides
+        # 用户原投入字段全保留
+        for k, v in overrides.items():
+            if k == "infonoise_enabled":
+                continue
+            assert getattr(cfg, k) == v, overrides
+
+
+def test_tolerant_validate_infonoise_mutex_multi_conflict_one_pass() -> None:
+    """同时 4 条互斥全冲突 → 一刀关 InfoNoise，4 字段全保留，defaulted 只有
+    "infonoise_enabled"（一次性处理，不重复 append）。"""
+    cfg, _, defaulted = presets_io._tolerant_validate({
+        "infonoise_enabled": True,
+        "noise_enhancement_type": "offset",
+        "loss_weighting": "detail_inv_t",
+        "loss_type": "huber",
+        "timestep_schedule_shift": 2.0,
+    })
+    assert cfg.infonoise_enabled is False
+    assert cfg.noise_enhancement_type == "offset"
+    assert cfg.loss_weighting == "detail_inv_t"
+    assert cfg.loss_type == "huber"
+    assert cfg.timestep_schedule_shift == 2.0
+    assert defaulted == ["infonoise_enabled"]
+
+
+def test_write_preset_strict_path_still_rejects_infonoise_mutex(
+    presets_dir: Path,
+) -> None:
+    """write_preset 走严格 model_validate（非 tolerant）—— 互斥配置直接拒，
+    防 UI 绕过 disable_when 锁直接发 PUT 提交 silent 改值。"""
+    with pytest.raises(presets_io.PresetError):
+        presets_io.write_preset("conflict", {
+            **_payload(),
+            "infonoise_enabled": True,
+            "loss_type": "huber",
+        })
 
 
 # ---------------------------------------------------------------------------

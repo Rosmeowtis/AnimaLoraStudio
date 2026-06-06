@@ -18,20 +18,16 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .common import AttentionBackend, _meta
-from .migrations import (
-    migrate_legacy_attention,
-    migrate_legacy_save_keys,
-    migrate_noise_enhancement_type,
-)
+from .migrations import migrate_legacy_save_keys, migrate_noise_enhancement_type
 
 
 class TrainingConfig(BaseModel):
     """与 config/train_template.yaml 对齐的完整训练参数。
 
-    `extra="forbid"`：未知键直接报错，避免拼写错误悄悄失效。
+    `extra="ignore"`：云端/旧版预设里多出的键静默丢弃。
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     # ---------------------------------------------------------------- 模型路径
     # 这些路径在 Studio 创建 version 时会被替换成 **绝对路径**（基于
@@ -200,7 +196,7 @@ class TrainingConfig(BaseModel):
     )
     learning_rate: float = Field(
         1e-4, gt=0.0,
-        description="学习率（Prodigy 必须为 1.0）",
+        description="学习率。Automagic 作为初始每参数学习率，推荐 1e-6（切换 optimizer 到 automagic 时会自动改写）；Lion 推荐为 AdamW lr / 3；Prodigy / PPSF 必须 1.0",
         json_schema_extra=_meta(
             "training",
             cli_alias="--lr",
@@ -209,14 +205,14 @@ class TrainingConfig(BaseModel):
             disable_hint="Prodigy 接管学习率",
         ),
     )
-    lr_scheduler: Literal["none", "cosine", "cosine_with_restart"] = Field(
+    lr_scheduler: Literal["none", "cosine", "cosine_with_restart", "cosine_with_warmup"] = Field(
         "none",
         description="学习率调度（none = 常数；Prodigy / PPSF 固定为 none）",
         json_schema_extra=_meta(
             "training",
-            disable_when="optimizer_type==prodigy||optimizer_type==prodigy_plus_schedulefree",
+            disable_when="optimizer_type==automagic||optimizer_type==prodigy||optimizer_type==prodigy_plus_schedulefree",
             disable_value="none",
-            disable_hint="Prodigy 固定为常数学习率",
+            disable_hint="自适应优化器固定为常数学习率",
         ),
     )
     lr_scheduler_t0: int = Field(
@@ -234,9 +230,14 @@ class TrainingConfig(BaseModel):
         description="学习率衰减下限：cosine 调度到此值后不再下降；通常远小于初始 lr（如初始 1e-4 配 1e-6）",
         json_schema_extra=_meta("training", show_when="lr_scheduler!=none", advanced=True),
     )
-    optimizer_type: Literal["adamw", "prodigy", "prodigy_plus_schedulefree"] = Field(
+    lr_scheduler_warmup_steps: int = Field(
+        100, ge=0,
+        description="cosine_with_warmup 预热步数",
+        json_schema_extra=_meta("training", show_when="lr_scheduler==cosine_with_warmup", advanced=True),
+    )
+    optimizer_type: Literal["adamw", "automagic", "lion", "prodigy", "prodigy_plus_schedulefree"] = Field(
         "adamw",
-        description="优化器。adamw 需手动调 lr；prodigy / prodigy_plus_schedulefree 自适应估计 lr（lr 字段填 1.0）",
+        description="优化器。adamw 标准基线；automagic 自适应每参数 lr（推荐 lr=1e-6）；lion 显存约 AdamW 一半（推荐 lr=AdamW lr / 3）；prodigy / prodigy_plus_schedulefree 自适应估 lr（lr 填 1.0）",
         json_schema_extra=_meta("training"),
     )
     prodigy_d_coef: float = Field(
@@ -248,6 +249,46 @@ class TrainingConfig(BaseModel):
         True,
         description="Prodigy warmup 期间防止 d 被初期高梯度推高；默认开启更稳",
         json_schema_extra=_meta("training", show_when="optimizer_type==prodigy", advanced=True),
+    )
+    lion_beta1: float = Field(
+        0.9, ge=0.0, lt=1.0,
+        description="Lion β1（动量插值系数）",
+        json_schema_extra=_meta("training", show_when="optimizer_type==lion", advanced=True),
+    )
+    lion_beta2: float = Field(
+        0.99, ge=0.0, lt=1.0,
+        description="Lion β2（动量累计系数）",
+        json_schema_extra=_meta("training", show_when="optimizer_type==lion", advanced=True),
+    )
+    automagic_min_lr: float = Field(
+        1e-7, ge=0.0,
+        description="Automagic 每参数学习率下限",
+        json_schema_extra=_meta("training", show_when="optimizer_type==automagic", advanced=True),
+    )
+    automagic_max_lr: float = Field(
+        1e-3, gt=0.0,
+        description="Automagic 每参数学习率上限",
+        json_schema_extra=_meta("training", show_when="optimizer_type==automagic", advanced=True),
+    )
+    automagic_lr_bump: float = Field(
+        1e-6, ge=0.0,
+        description="Automagic 同向/反向更新时调整每参数学习率的步幅",
+        json_schema_extra=_meta("training", show_when="optimizer_type==automagic", advanced=True),
+    )
+    automagic_beta2: float = Field(
+        0.999, ge=0.0, lt=1.0,
+        description="Automagic 二阶矩 β2",
+        json_schema_extra=_meta("training", show_when="optimizer_type==automagic", advanced=True),
+    )
+    automagic_eps: float = Field(
+        1e-30, gt=0.0,
+        description="Automagic 数值稳定项",
+        json_schema_extra=_meta("training", show_when="optimizer_type==automagic", advanced=True),
+    )
+    automagic_clip_threshold: float = Field(
+        1.0, gt=0.0,
+        description="Automagic update RMS 裁剪阈值",
+        json_schema_extra=_meta("training", show_when="optimizer_type==automagic", advanced=True),
     )
     # ---------------- ProdigyPlusScheduleFree (PPSF) 专属字段 ----------------
     # 选 PPSF 时 lr_scheduler 必须为 none（Schedule-Free 不需要 scheduler，
@@ -309,22 +350,27 @@ class TrainingConfig(BaseModel):
     )
     noise_enhancement_type: Literal["none", "offset", "pyramid"] = Field(
         "none",
-        description="二选一：offset 给噪声加常数低频偏移（亮暗对比）；pyramid 多尺度叠加低频噪声（构图/光照）。两者互斥",
-        json_schema_extra=_meta("noise_augmentation", advanced=True),
+        description="噪声增强机制（默认 none）。offset 在噪声上加 per-sample DC 偏置；pyramid 在多个尺度叠加低频噪声。两者机制不同，但都改变低频成分，互斥防双倍叠加。LoRA 训练默认保持 none",
+        json_schema_extra=_meta(
+            "noise_augmentation",
+            advanced=True,
+            disable_when="infonoise_enabled==true",
+            disable_hint="InfoNoise 启用时禁用噪声增强（schema 互斥）",
+        ),
     )
     noise_offset: float = Field(
         0.0, ge=0.0, le=0.2,
-        description="低频偏移强度，缓解亮度均值偏差。越大对比越强；常用 0.05-0.1",
+        description="DC 偏置强度（0-0.2，0=关闭）。让噪声 mean 偏离 0，让模型有机会学习生成极端亮度场景（pure black / pure white / 强对比）。典型范围 0.05-0.1；0.05 以下噪声场跟 baseline 几乎一样，超过 0.1 起点 loss 会显著偏高",
         json_schema_extra=_meta("noise_augmentation", show_when="noise_enhancement_type==offset", advanced=True),
     )
     pyramid_noise_iters: int = Field(
         0, ge=0, le=6,
-        description="多尺度噪声叠加层数；越多覆盖的低频尺度越广。2-3 帮助全局光照与构图学习",
+        description="金字塔噪声层数（0-6，0=关闭）。每层在 spatial // 2^(k+1) 尺度注入。实际效果强度由 pyramid_noise_discount 决定 —— iters 单独决定覆盖的频段范围，discount 低时层数多少差异很小",
         json_schema_extra=_meta("noise_augmentation", show_when="noise_enhancement_type==pyramid", advanced=True),
     )
     pyramid_noise_discount: float = Field(
-        0.35, ge=0.1, le=0.9,
-        description="金字塔每层相对上一层的衰减系数；越大每层贡献递减越慢、低频扰动越强；越小逼近标准噪声",
+        0.5, ge=0.1, le=0.9,
+        description="每层相对衰减系数（0.1-0.9）。控制低频强度的核心参数：anima 实现把整体噪声 std 归一化到 1，所以 discount 决定低频占比。0.1-0.4 归一化后噪声接近标准高斯，等价于关闭；0.5-0.7 显著改变低频结构",
         json_schema_extra=_meta("noise_augmentation", show_when="noise_enhancement_type==pyramid", advanced=True),
     )
     timestep_sampling: Literal[
@@ -341,8 +387,6 @@ class TrainingConfig(BaseModel):
             "timestep_sampling",
             alt_description="【时间步采样】分布；InfoNoise 启用时作为热身期 baseline，正式阶段由自适应 CDF 接管",
             alt_description_when="infonoise_enabled==true",
-            disable_when="infonoise_enabled==true",
-            disable_hint="InfoNoise 接管时间步采样",
             advanced=True,
         ),
     )
@@ -354,8 +398,6 @@ class TrainingConfig(BaseModel):
             show_when="timestep_sampling!=uniform",
             alt_description="【InfoNoise 热身期】InfoNoise 开启时作为热身阶段的 baseline shift，正式阶段由自适应 CDF 接管",
             alt_description_when="infonoise_enabled==true",
-            disable_when="infonoise_enabled==true",
-            disable_hint="InfoNoise 接管时间步采样",
             advanced=True,
         ),
     )
@@ -378,12 +420,24 @@ class TrainingConfig(BaseModel):
             alt_description="【InfoNoise 热身期】InfoNoise 开启时仅热身期生效；正式阶段由自适应 CDF 接管",
             alt_description_when="infonoise_enabled==true",
             advanced=True,
+            disable_when="infonoise_enabled==true",
+            disable_hint="InfoNoise 启用时禁用 schedule shift（schema 互斥，仅 1.0 兼容）",
         ),
     )
     infonoise_enabled: bool = Field(
         False,
         description="【InfoNoise】启用自适应时间步采样：训练中根据信息量自动调整 t 分布，聚焦更有效的训练区间",
-        json_schema_extra=_meta("timestep_sampling", advanced=True),
+        json_schema_extra=_meta(
+            "timestep_sampling",
+            advanced=True,
+            disable_when=(
+                "noise_enhancement_type!=none"
+                "||loss_weighting!=none"
+                "||loss_type==huber"
+                "||timestep_schedule_shift!=1"
+            ),
+            disable_hint="互斥字段（noise_enhancement / loss_weighting / loss_type / schedule_shift）非默认时不可启用（schema 互斥）",
+        ),
     )
     infonoise_K: int = Field(
         64, ge=16, le=256,
@@ -412,13 +466,22 @@ class TrainingConfig(BaseModel):
     )
     infonoise_N_min: int = Field(
         50, ge=1,
-        description="【InfoNoise】刷新触发条件：每个 bin 至少需要的样本数才会重算分布",
+        description="【InfoNoise】刷新触发条件：每个 bin 至少需要的样本数才会重算分布（必须 ≤ infonoise_B）",
+        json_schema_extra=_meta("timestep_sampling", show_when="infonoise_enabled==true", advanced=True),
+    )
+    infonoise_gate_pivot_c: float = Field(
+        0.15, ge=0.0, le=10.0,
+        description="【InfoNoise】gate 函数 pivot c：默认 0.15（论文 §5 CIFAR 报告值，跨数据集鲁棒）；设 0 走自适应选取（论文 Eq 87 字面实现）；其他正数为自定义 c。多数情况保持默认",
         json_schema_extra=_meta("timestep_sampling", show_when="infonoise_enabled==true", advanced=True),
     )
     loss_type: Literal["mse", "huber"] = Field(
         "mse",
         description="训练 loss 类型。mse 经典；huber 对 outlier 鲁棒（在 |x|<δ 时用二次，|x|≥δ 时用线性）",
-        json_schema_extra=_meta("loss"),
+        json_schema_extra=_meta(
+            "loss",
+            disable_when="infonoise_enabled==true",
+            disable_hint="InfoNoise 启用时禁用 loss 类型切换（schema 互斥，仅 mse 兼容）",
+        ),
     )
     huber_c: float = Field(
         0.15, ge=0.01, le=5.0,
@@ -428,7 +491,11 @@ class TrainingConfig(BaseModel):
     loss_weighting: Literal["none", "min_snr", "detail_inv_t", "cosmap"] = Field(
         "none",
         description="loss 加权方案：none 不加权；min_snr 抑制极端时步的权重；detail_inv_t 强化低 t 细节；cosmap 用 SD3 cosine 映射",
-        json_schema_extra=_meta("loss"),
+        json_schema_extra=_meta(
+            "loss",
+            disable_when="infonoise_enabled==true",
+            disable_hint="InfoNoise 启用时禁用 loss 加权（schema 互斥，仅 none 兼容）",
+        ),
     )
     min_snr_gamma: float = Field(
         5.0, ge=0.1, le=20.0,
@@ -475,11 +542,6 @@ class TrainingConfig(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _migrate_attention(cls, data: Any) -> Any:
-        return migrate_legacy_attention(data)
-
-    @model_validator(mode="before")
-    @classmethod
     def _migrate_save_keys(cls, data: Any) -> Any:
         return migrate_legacy_save_keys(data)
 
@@ -491,10 +553,10 @@ class TrainingConfig(BaseModel):
     @model_validator(mode="after")
     def _validate_prodigy_scheduler(self) -> "TrainingConfig":
         """Prodigy 系列固定使用常数学习率，外部 scheduler 统一拦截。"""
-        if self.optimizer_type in {"prodigy", "prodigy_plus_schedulefree"} and self.lr_scheduler != "none":
+        if self.optimizer_type in {"automagic", "prodigy", "prodigy_plus_schedulefree"} and self.lr_scheduler != "none":
             raise ValueError(
                 f"optimizer_type={self.optimizer_type} requires lr_scheduler=none "
-                "(Prodigy 系列固定使用常数学习率)."
+                "(自适应优化器固定使用常数学习率)."
             )
         return self
 
@@ -505,6 +567,85 @@ class TrainingConfig(BaseModel):
             raise ValueError(
                 f"detail_inv_t_min ({self.detail_inv_t_min}) 不能大于 "
                 f"detail_inv_t_max ({self.detail_inv_t_max})。"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_infonoise_loss_weighting_exclusive(self) -> "TrainingConfig":
+        """InfoNoise 与 loss_weighting 互斥：两者都在做 schedule 重塑，叠加会互相消磨。
+
+        InfoNoise 用未加权 MSE 估各噪声区间的信息量（论文 entropy rate 推导的必要前提，
+        见 arxiv 2602.18647 §3.1）；loss_weighting 改实际优化目标。同开时 InfoNoise 学
+        到的分布跟用户配的 loss_weighting 方向冲突（如 detail_inv_t 抬高低 t 权重 vs
+        InfoNoise 默认压低低 t 采样）。强制二选一避免 silent 不一致。
+        """
+        if self.infonoise_enabled and self.loss_weighting != "none":
+            raise ValueError(
+                f"infonoise_enabled=true 与 loss_weighting={self.loss_weighting!r} 互斥："
+                "两个机制都在做 schedule 重塑（前者自适应 resample，后者手工 reweight）。"
+                "请二选一：(a) 关闭 InfoNoise 走传统 loss_weighting 路径；"
+                "或 (b) 设 loss_weighting=none 走 InfoNoise 自适应路径。"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_infonoise_n_min_le_b(self) -> "TrainingConfig":
+        """N_min > B 会让自适应分布永远学不出来（FIFO 容量不够触发刷新）。"""
+        if self.infonoise_enabled and self.infonoise_N_min > self.infonoise_B:
+            raise ValueError(
+                f"infonoise_N_min ({self.infonoise_N_min}) 不能大于 "
+                f"infonoise_B ({self.infonoise_B})：超出会让自适应分布永远学不出来。"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_infonoise_schedule_shift_exclusive(self) -> "TrainingConfig":
+        """InfoNoise 与 timestep_schedule_shift 互斥：InfoNoise CDF 接管后 shift 静默失效。
+
+        timestep_schedule_shift 仅在 sample_t 的 baseline 路径生效；InfoNoise sample()
+        走 CDF 路径直接返回 t，不再应用 shift。同开时用户期望的"全程偏移"会在 warmup
+        结束后悄悄消失。强制二选一，避免 silent 行为切换。
+        """
+        if self.infonoise_enabled and self.timestep_schedule_shift != 1.0:
+            raise ValueError(
+                f"infonoise_enabled=true 与 timestep_schedule_shift={self.timestep_schedule_shift} 互斥："
+                "InfoNoise 自适应 CDF 接管后 schedule_shift 不再生效，会在 warmup 结束时"
+                "悄悄切换行为。请二选一：(a) 关闭 InfoNoise 保留 schedule_shift；"
+                "或 (b) 设 timestep_schedule_shift=1.0 走 InfoNoise 自适应路径。"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_infonoise_loss_type_exclusive(self) -> "TrainingConfig":
+        """InfoNoise 与 loss_type=huber 互斥：huber 削峰让 InfoNoise 推 mass 进死循环。
+
+        InfoNoise 用 raw MSE（不削峰）估各噪声区间的信息量，huber 让模型对 outlier
+        不学。某区间 outlier 多时，InfoNoise 看到 raw MSE 仍高 → 推 mass 过去 → huber
+        让模型仍然不学那里 → raw MSE 仍高 → InfoNoise 继续推 mass 过去（反馈环）。
+        """
+        if self.infonoise_enabled and self.loss_type == "huber":
+            raise ValueError(
+                "infonoise_enabled=true 与 loss_type=huber 互斥：huber 对 outlier 鲁棒"
+                "（不学），但 InfoNoise 用 raw MSE 看到 outlier 区间高损失会持续把采样推过去，"
+                "形成 mass 集中在不学的区间的反馈环。请二选一：(a) 关闭 InfoNoise 保留 huber；"
+                "或 (b) 设 loss_type=mse 走 InfoNoise 自适应路径。"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_infonoise_noise_enhancement_exclusive(self) -> "TrainingConfig":
+        """InfoNoise 与 noise_enhancement_type 互斥：噪声增强改变 noise 形状会让 InfoNoise
+        schedule 偏离论文最优。
+
+        InfoNoise 论文 I-MMSE 推导假设标准高斯 noise；offset 加 DC 偏置、pyramid 加多尺度
+        低频成分都改变 noise 频谱，让 InfoNoise 学到的不再是 clean entropy rate profile。
+        """
+        if self.infonoise_enabled and self.noise_enhancement_type != "none":
+            raise ValueError(
+                f"infonoise_enabled=true 与 noise_enhancement_type={self.noise_enhancement_type!r} 互斥："
+                "噪声增强会改变 noise 形状，让 InfoNoise 学到的 schedule 偏离论文最优"
+                "（I-MMSE 推导假设标准高斯 noise）。请二选一：(a) 关闭 InfoNoise 保留噪声增强；"
+                "或 (b) 设 noise_enhancement_type=none 走 InfoNoise 自适应路径。"
             )
         return self
 
@@ -622,6 +763,88 @@ class TrainingConfig(BaseModel):
                     "训练时 bootstrap_phase 会自动 prepend 到 sample_prompt / "
                     "sample_prompts，确保采样图能反映 LoRA 是否激活。",
         json_schema_extra=_meta("sample", hidden=True),
+    )
+
+    # --------------------------------------------------------------- WandB 预设覆盖
+    wandb_notice: str = Field(
+        "",
+        description="⚠️ 如果你不知道自己在做什么，请不要填写这里的设置。此处的值会覆盖全局 Settings 页的 WandB 配置，留空则使用全局设置。",
+        json_schema_extra=_meta("wandb", "notice", advanced=True),
+    )
+    wandb_enabled: Optional[bool] = Field(
+        None,
+        description="启用 WandB（留空使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_api_key: str = Field(
+        "",
+        description="API Key（留空使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_project: str = Field(
+        "",
+        description="项目名（留空使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_entity: str = Field(
+        "",
+        description="Entity / Team（留空使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_base_url: str = Field(
+        "",
+        description="自定义 WandB 服务地址（留空使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_mode: Literal["", "online", "offline", "disabled"] = Field(
+        "",
+        description="运行模式 online/offline/disabled（留空使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_log_samples: Optional[bool] = Field(
+        None,
+        description="上传采样图到 WandB（留空使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_sample_max_side: int = Field(
+        0, ge=0,
+        description="采样图缩放最长边像素（0=使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_sample_every_n_steps: int = Field(
+        -1, ge=-1,
+        description="采样图上传节流步数（-1=使用全局设置，0=不节流）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_upload_model: Optional[bool] = Field(
+        None,
+        description="上传模型 artifact（留空使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_upload_model_policy: Literal["", "all", "last"] = Field(
+        "",
+        description="模型保留策略 all/last（留空使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_upload_state_manual: Optional[bool] = Field(
+        None,
+        description="上传手动保存的训练状态 artifact（留空使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_upload_state_manual_policy: Literal["", "all", "last"] = Field(
+        "",
+        description="手动状态保留策略 all/last（留空使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_upload_state_auto: Optional[bool] = Field(
+        None,
+        description="上传自动保存的训练状态 artifact（留空使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
+    )
+    wandb_upload_state_auto_policy: Literal["", "all", "last"] = Field(
+        "",
+        description="自动状态保留策略 all/last（留空使用全局设置）",
+        json_schema_extra=_meta("wandb", advanced=True),
     )
 
     # ---------------------------------------------------------------- 监控/进度

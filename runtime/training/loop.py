@@ -138,7 +138,18 @@ def run(ctx: TrainingContext) -> None:
                     _raw_mse = _raw_mse_per_sample.mean(
                         dim=list(range(1, _raw_mse_per_sample.dim()))
                     )
-                ctx.timestep_sampler.record(t.detach(), _raw_mse)
+                # 仅 main 集样本进 InfoNoise schedule 学习：I-MMSE 假设单一数据分布，
+                # reg 集典型是通用图（booru）vs main 集是单一主题，混入 record 学到的是
+                # mixture MMSE 不是 mmse_main(t)。用 is_reg flag 而非 loss_weight 阈值
+                # 是因为 distribution identity 跟 gradient 权重是两条独立轴
+                # （reg_weight=1.0 时 loss_weight=1.0 但 reg 仍是不同分布）。
+                # 见 docs/todo/infonoise-reg-policy-reeval.md 未来重评估条件。
+                if "is_reg" in batch:
+                    _main_mask = ~batch["is_reg"].to(t.device)
+                    if _main_mask.any():
+                        ctx.timestep_sampler.record(t.detach()[_main_mask], _raw_mse[_main_mask])
+                else:
+                    ctx.timestep_sampler.record(t.detach(), _raw_mse)
                 # 按样本加权（正则集可降低权重）
                 if "loss_weight" in batch:
                     w = batch["loss_weight"].to(ctx.device).view(-1, *([1] * (loss_per_sample.dim() - 1)))
@@ -282,6 +293,7 @@ def run(ctx: TrainingContext) -> None:
                     with optimizer_eval_mode(ctx.optimizer):
                         ctx.injector.save(lora_path)
                     ctx.emit(f"Saved LoRA: {lora_path}")
+                    ctx.wandb_monitor.upload_model(lora_path)
 
                 # 定期保存训练状态（断点续训）
                 save_state_every_steps = getattr(args, "save_state_every_steps", 0)
@@ -306,6 +318,7 @@ def run(ctx: TrainingContext) -> None:
                         lora_path = ctx.output_dir / f"{args.output_name}_step{ctx.global_step}.safetensors"
                         ctx.injector.save(lora_path)
                     ctx.emit(f"Saved training state (step {ctx.global_step}): {state_path.name}")
+                    ctx.wandb_monitor.upload_state_manual(state_path)
 
                 # 检查 max_steps
                 if args.max_steps and ctx.global_step >= args.max_steps:
@@ -329,6 +342,7 @@ def run(ctx: TrainingContext) -> None:
                 with optimizer_eval_mode(ctx.optimizer):
                     ctx.injector.save(save_path)
                 ctx.emit(f"Saved LoRA: {save_path}")
+                ctx.wandb_monitor.upload_model(save_path)
 
             # 采样（轮换提示词）
             if args.sample_every > 0 and ctx.current_epoch % args.sample_every == 0:
@@ -368,6 +382,7 @@ def run(ctx: TrainingContext) -> None:
                     if not lora_path.exists():
                         ctx.injector.save(lora_path)
                 ctx.emit(f"Saved training state (epoch {ctx.current_epoch}): {state_path.name}")
+                ctx.wandb_monitor.upload_state_manual(state_path)
 
             # ADR 0006 Addendum 1 方案 Δ：每 epoch 末尾**强制**写 auto_epoch_state.pt（覆盖式）。
             # 跟用户主动开的 save_state_every_epochs / save_state_every_steps（多份历史归档）独立，无 args gate ——
@@ -391,6 +406,7 @@ def run(ctx: TrainingContext) -> None:
                     monitor_state=monitor_data, scheduler=ctx.scheduler,
                     timestep_sampler=ctx.timestep_sampler,
                 )
+            ctx.wandb_monitor.upload_state_auto(auto_state_path)
             # 更新 ctx 字段供 handle_interrupt emit pause_state 用
             ctx.last_auto_epoch_state_path = auto_state_path
             ctx.last_auto_epoch_config_path = auto_config_path

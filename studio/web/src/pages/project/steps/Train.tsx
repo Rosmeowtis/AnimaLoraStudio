@@ -13,7 +13,8 @@ import {
 } from '../../../api/client'
 import ConfigSkeleton from '../../../components/ConfigSkeleton'
 import { useDialog } from '../../../components/Dialog'
-import SchemaForm from '../../../components/SchemaForm'
+import SchemaForm, { visibleSchemaGroups } from '../../../components/SchemaForm'
+import SchemaSectionIndex from '../../../components/SchemaSectionIndex'
 import StepShell from '../../../components/StepShell'
 import { useToast } from '../../../components/Toast'
 import { useSettingsDrawer } from '../../../lib/SettingsDrawer'
@@ -53,6 +54,8 @@ export default function TrainPage() {
   const [reg, setReg] = useState<RegStatus | null>(null)
   const [busy, setBusy] = useState(false)
   const [autoSyncPaths, setAutoSyncPaths] = useState<boolean>(true)
+  const [droppedFields, setDroppedFields] = useState<string[]>([])
+  const [defaultedFields, setDefaultedFields] = useState<string[]>([])
 
   /** 已落盘的 config JSON 快照，dirty 判断的 baseline。 */
   const savedJsonRef = useRef<string | null>(null)
@@ -90,6 +93,11 @@ export default function TrainPage() {
 
   const vid = activeVersion?.id ?? null
 
+  const applyPresetWarnings = useCallback((r: { dropped_fields?: string[]; defaulted_fields?: string[] }) => {
+    setDroppedFields(r.dropped_fields ?? [])
+    setDefaultedFields(r.defaulted_fields ?? [])
+  }, [])
+
   const refreshConfig = useCallback(async () => {
     if (!vid) return
     try {
@@ -97,10 +105,13 @@ export default function TrainPage() {
       setConfigResp(r)
       setConfigSync(r.config)
       savedJsonRef.current = JSON.stringify(r.config)
+      // 老 config 兼容（InfoNoise 互斥被后端自动关掉等）由后端写进 r.defaulted_fields，
+      // 顶部 banner 渲染。dropped_fields 兜底 schema 演进时丢弃的旧字段。
+      applyPresetWarnings(r)
     } catch (e) {
       toast(t('train.loadConfigFailed', { error: e }), 'error')
     }
-  }, [project.id, vid, toast, setConfigSync, t])
+  }, [project.id, vid, toast, setConfigSync, t, applyPresetWarnings])
 
   useEffect(() => {
     api.schema().then(setSchema).catch((e) => toast(t('train.loadSchemaFailed', { error: e }), 'error'))
@@ -109,6 +120,8 @@ export default function TrainPage() {
   }, [toast, t])
 
   useEffect(() => {
+    setDroppedFields([])
+    setDefaultedFields([])
     void refreshConfig()
   }, [refreshConfig])
 
@@ -245,6 +258,13 @@ export default function TrainPage() {
     [presets, pickerSearch],
   )
 
+  // 右侧 SchemaSectionIndex 的 IntersectionObserver root + 跳转目标
+  const schemaScrollRef = useRef<HTMLDivElement | null>(null)
+  const visibleGroups = useMemo(
+    () => (schema ? visibleSchemaGroups(schema, advancedMode) : []),
+    [schema, advancedMode],
+  )
+
   // popover 关闭：点外面 / Esc
   useEffect(() => {
     if (!pickerOpen) return
@@ -277,7 +297,8 @@ export default function TrainPage() {
     }
     setBusy(true)
     try {
-      await api.forkPresetForVersion(project.id, vid, name)
+      const r = await api.forkPresetForVersion(project.id, vid, name)
+      applyPresetWarnings(r)
       // refreshConfig 刷本页 config state；reload 刷父级 activeVersion，
       // 主表单字段才会同步显示新预设的内容。
       await Promise.all([refreshConfig(), reload()])
@@ -385,7 +406,8 @@ export default function TrainPage() {
 
       const name = generateUniquePresetName(defaultPresetName(), presets)
       await api.savePreset(name, cleaned)
-      await api.forkPresetForVersion(project.id, vid, name)
+      const r = await api.forkPresetForVersion(project.id, vid, name)
+      applyPresetWarnings(r)
 
       const list = await api.listPresets()
       setPresets(list)
@@ -452,7 +474,7 @@ export default function TrainPage() {
       <div className="flex flex-col h-full gap-3">
 
         {/* 两栏布局：左（预设 + config 编辑） / 右（估算面板） */}
-        <div className="grid grid-cols-[1.5fr_1fr] gap-3 flex-1 min-h-0">
+        <div className="grid grid-cols-[3fr_1fr] gap-3 flex-1 min-h-0">
 
           {/* 左栏 */}
           <div className="flex flex-col gap-3 min-h-0 min-w-0 overflow-y-auto">
@@ -584,7 +606,7 @@ export default function TrainPage() {
                 {t('train.noConfigHint')}
               </div>
             ) : config ? (
-              <section className="flex-1 min-h-0 overflow-y-auto pr-1">
+              <section ref={schemaScrollRef} className="flex-1 min-h-0 overflow-y-auto pr-1">
                 <div className="flex justify-end mb-2">
                   <div className="inline-flex rounded-md border border-subtle overflow-hidden text-xs">
                     <button
@@ -603,6 +625,17 @@ export default function TrainPage() {
                     </button>
                   </div>
                 </div>
+                {(droppedFields.length > 0 || defaultedFields.length > 0) && (
+                  <div className="mb-3 rounded-md border border-amber-400/50 bg-amber-950/60 px-3.5 py-2.5 text-xs text-amber-100 space-y-1">
+                    <span className="font-semibold text-amber-300">{t('presets.compatNoticeTitle')}</span>
+                    {droppedFields.length > 0 && (
+                      <div>{t('presets.droppedFieldsBody')}<code className="ml-1 text-[11px] opacity-80">{droppedFields.join(', ')}</code></div>
+                    )}
+                    {defaultedFields.length > 0 && (
+                      <div>{t('presets.defaultedFieldsBody')}<code className="ml-1 text-[11px] opacity-80">{defaultedFields.join(', ')}</code></div>
+                    )}
+                  </div>
+                )}
                 <SchemaForm
                   schema={schema}
                   values={config}
@@ -619,12 +652,22 @@ export default function TrainPage() {
             )}
           </div>
 
-        {/* 右栏：训练集 + 正则集分布 */}
-        <DatasetStatsPanel
-          activeVersion={activeVersion}
-          reg={reg}
-          config={config}
-        />
+        {/* 右栏：训练集 + 正则集分布 + 章节锚点导航 */}
+        <div className="flex flex-col min-h-0 min-w-0 overflow-y-auto">
+          <DatasetStatsPanel
+            activeVersion={activeVersion}
+            reg={reg}
+            config={config}
+          />
+          {configResp?.has_config && config && visibleGroups.length > 0 && (
+            <div className="mt-8">
+              <SchemaSectionIndex
+                groups={visibleGroups}
+                scrollContainer={schemaScrollRef}
+              />
+            </div>
+          )}
+        </div>
       </div>
     </div>
     </StepShell>

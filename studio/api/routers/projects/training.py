@@ -567,7 +567,7 @@ def get_version_config_endpoint(pid: int, vid: int) -> dict[str, Any]:
             "project_specific_defaults": psd,
         }
     try:
-        cfg = version_config.read_version_config(project, ver)
+        cfg, dropped, defaulted = version_config.read_version_config_with_warnings(project, ver)
     except version_config.VersionConfigError as exc:
         raise HTTPException(422, str(exc)) from exc
     return {
@@ -575,6 +575,8 @@ def get_version_config_endpoint(pid: int, vid: int) -> dict[str, Any]:
         "config": cfg,
         "project_specific_fields": psf,
         "project_specific_defaults": psd,
+        "dropped_fields": dropped,
+        "defaulted_fields": defaulted,
     }
 
 
@@ -607,7 +609,9 @@ def fork_preset_for_version_endpoint(
     """从全局 preset 复制一份进 version 私有 config（应用项目特定字段）。"""
     project, ver = _project_and_version_or_404(pid, vid)
     try:
-        cfg = preset_flow.fork_preset_for_version(body.name, project, ver)
+        cfg, dropped, defaulted = preset_flow.fork_preset_for_version_with_warnings(
+            body.name, project, ver
+        )
     except presets_io.PresetError as exc:
         _err_code(exc); raise  # PR-2 C4: DomainError handler 翻 envelope
     except version_config.VersionConfigError as exc:
@@ -615,7 +619,13 @@ def fork_preset_for_version_endpoint(
     # 同步 versions.config_name = 来源 preset 名（informational only）
     with db.connection_for() as conn:
         versions.update_version(conn, vid, config_name=body.name)
-    return {"has_config": True, "config": cfg, "from_preset": body.name}
+    return {
+        "has_config": True,
+        "config": cfg,
+        "from_preset": body.name,
+        "dropped_fields": dropped,
+        "defaulted_fields": defaulted,
+    }
 
 
 @router.post("/api/projects/{pid}/versions/{vid}/config/save_as_preset")
