@@ -114,6 +114,11 @@ class TrainingConfig(BaseModel):
         description="缓存 VAE latent 加速训练",
         json_schema_extra=_meta("system"),
     )
+    vae_cache_batch_size: int = Field(
+        0, ge=0,
+        description="VAE latent 缓存编码批次大小；0=跟随训练 batch size，显存不足时设为 1 逐张编码",
+        json_schema_extra=_meta("system", advanced=True),
+    )
 
     # ------------------------------------------------------------------- LoRA
     lora_type: Literal["lora", "lokr", "loha"] = Field(

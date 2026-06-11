@@ -372,6 +372,7 @@
       "tag_dropout": "训练时每个标签的随机丢弃概率（0 = 关闭）；非 0 帮助泛化、减弱单标签依赖",
       "prefer_json": "优先使用 JSON 标签文件（推荐，支持分类 shuffle）",
       "cache_latents": "缓存 VAE latent 加速训练",
+      "vae_cache_batch_size": "VAE latent 缓存编码批次大小；0=跟随训练 batch size，显存不足时设为 1 逐张编码",
       "lora_type": "适配器算法。lokr Kronecker 分解参数最省（默认）；lora 经典低秩通用；loha Hadamard 积，表达力较高但参数较多",
       "lora_rank": "rank：越大表达力越强，参数量与显存上升、易过拟合；越小越省但易欠拟合。常用 8/16/32/64",
       "lora_alpha": "alpha：LoRA 缩放系数，越大 LoRA 效果越强。通常等于 rank；启用 rs_lora 时常设为 √rank",
