@@ -373,6 +373,7 @@
       "flip_augment": "Horizontal flip augmentation",
       "tag_dropout": "Per-tag random dropout probability during training (0 = off); non-zero values help generalization and reduce single-tag dependence",
       "prefer_json": "Prefer JSON tag files (recommended; supports category shuffle)",
+      "caption_comfy_encoding": "Encode captions the ComfyUI way (same pipeline as test generation; recommended)",
       "cache_latents": "Cache VAE latents to speed up training",
       "vae_cache_batch_size": "VAE latent cache encoding batch size; 0 = follow training batch size, set to 1 if VRAM is tight",
       "lora_type": "Adapter algorithm. lokr: Kronecker factorization, smallest parameter count (default); lora: classic low-rank, general purpose; loha: Hadamard product, higher expressiveness but more parameters; ortho: SVD/Cayley orthogonal parameterization; tlora: timestep-adaptive rank",
@@ -1020,6 +1021,12 @@
       "help": "The generate daemon keeps the model in VRAM after the first run so you can quickly retry with different params. If no new generation arrives within this window, the model is auto-unloaded to free VRAM (next run reloads, ~30-60s). 0 = off, keep the model resident until you manually click \"Free VRAM\". Recommended: 10 minutes.",
       "minutesSuffix": "min",
       "offHint": "Off: model stays resident until manually freed"
+    },
+    "vaePrecision": {
+      "title": "VAE decode precision",
+      "label": "Test generation VAE precision",
+      "desc": "Default: bf16 (matches ComfyUI on modern GPUs)",
+      "help": "Precision used for the final VAE decode in test generation. bf16 matches ComfyUI's automatic VAE dtype on modern GPUs and is the default. fp32 decodes in full precision: peak VRAM is higher, so the daemon temporarily offloads the DiT/Qwen models to CPU around the decode (slower per image)."
     },
     "saveTestImages": {
       "title": "Save test images to disk",

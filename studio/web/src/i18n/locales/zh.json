@@ -373,6 +373,7 @@
       "flip_augment": "水平翻转增强",
       "tag_dropout": "训练时每个标签的随机丢弃概率（0 = 关闭）；非 0 帮助泛化、减弱单标签依赖",
       "prefer_json": "优先使用 JSON 标签文件（推荐，支持分类 shuffle）",
+      "caption_comfy_encoding": "标签按 ComfyUI 方式编码（与测试出图同一链路，推荐开启）",
       "cache_latents": "缓存 VAE latent 加速训练",
       "vae_cache_batch_size": "VAE latent 缓存编码批次大小；0=跟随训练 batch size，显存不足时设为 1 逐张编码",
       "lora_type": "适配器算法。lokr Kronecker 分解参数最省（默认）；lora 经典低秩通用；loha Hadamard 积，表达力较高但参数较多；ortho 使用 SVD/Cayley 正交参数化；tlora 时间步自适应 rank",
@@ -1020,6 +1021,12 @@
       "help": "测试出图模型加载后会常驻显存，方便重复调参。超过指定时长没出图就自动卸载释放显存（下次出图重新加载约 30-60 秒）。0 = 关闭，模型常驻直到手动点\"清理显存\"。推荐 10 分钟。",
       "minutesSuffix": "分",
       "offHint": "已关闭：模型常驻直到手动清理"
+    },
+    "vaePrecision": {
+      "title": "VAE 解码精度",
+      "label": "测试出图 VAE 精度",
+      "desc": "默认 bf16（与 ComfyUI 在现代显卡上的默认一致）",
+      "help": "测试出图最后一步 VAE 解码使用的精度。bf16 与 ComfyUI 在现代显卡上自动选择的 VAE 精度一致，为默认值。fp32 全精度解码：显存峰值更高，daemon 会在解码前后临时把 DiT/Qwen 模型挪到内存腾显存（每张图更慢）。"
     },
     "saveTestImages": {
       "title": "测试出图自动落盘",
