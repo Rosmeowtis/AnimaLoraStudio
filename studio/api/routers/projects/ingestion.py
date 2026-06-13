@@ -24,10 +24,9 @@
 """
 from __future__ import annotations
 
-import io
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -161,6 +160,15 @@ async def upload_local_files(
     用户 F5 刷新时连静态资源都拉不动，看起来"完全卡死"，并且 SIGINT 被 PIL/zipfile
     C 扩展持 GIL 卡掉，终端 Ctrl-C 也无效。挪进 run_in_threadpool 让 event loop
     保持响应。
+
+    上传体走流式：把 UploadFile.file (SpooledTemporaryFile) 直接交给 accept_many，
+    **不**用 `await f.read()` 整包吞进 Python bytes。1GB zip 内存峰值从 1GB
+    （bytes 对象）降到 ~1MB（SpooledTemporaryFile 默认 spool 阈值，超出部分落
+    临时盘）。内存紧的云训练机（16GB 总内存 + PyTorch 已吃大半）原来会触发 swap
+    → 处理速度掉 10×，hotfix 后不再 swap。
+
+    on_log 转发 service 阶段日志（每 25 张 / 5s / 慢图 >1s）到模块 logger，
+    用户 server 控制台 + studio.log 都能看到进度，不再是"卡 100% 几十分钟无反馈"。
     """
     if not files:
         raise HTTPException(400, "没有上传文件")
@@ -170,18 +178,19 @@ async def upload_local_files(
         raise HTTPException(404, f"项目不存在: id={pid}")
     pdir = projects.project_dir(p["id"], p["slug"]) / "download"
 
-    # 全量读入内存交给 service 解析；FastAPI 的 UploadFile 内部本就是 SpooledTemporaryFile，
-    # 大文件会落临时盘，所以这里 read() 不会立即吃光内存。
-    pairs: list[tuple[str, io.BytesIO]] = []
+    # 流式：直接传 SpooledTemporaryFile，不读进 bytes 对象。f.file 是 seekable
+    # 的（zipfile.ZipFile 要求），FastAPI 写完后 cursor 不保证在 0 → 手动 seek。
+    pairs: list[tuple[str, BinaryIO]] = []
     for f in files:
-        data = await f.read()
-        pairs.append((f.filename or "", io.BytesIO(data)))
+        f.file.seek(0)
+        pairs.append((f.filename or "", f.file))
     sec = secrets.load()
     result = await run_in_threadpool(
         uploads_svc.accept_many,
         pairs, pdir,
         convert_to_png=sec.gelbooru.convert_to_png,
         remove_alpha_channel=sec.gelbooru.remove_alpha_channel,
+        on_log=logger.info,
     )
     return _apply_project_upload_result(pid, result)
 
@@ -205,10 +214,12 @@ def upload_local_file_from_path(pid: int, body: UploadFromPathBody) -> dict[str,
     pdir = projects.project_dir(p["id"], p["slug"]) / "download"
     sec = secrets.load()
     with src.open("rb") as fh:
+        # 本路由是 sync def，FastAPI 自动跑在 threadpool worker（不会卡 event loop）
         result = uploads_svc.accept_many(
             [(src.name, fh)], pdir,
             convert_to_png=sec.gelbooru.convert_to_png,
             remove_alpha_channel=sec.gelbooru.remove_alpha_channel,
+            on_log=logger.info,
         )
     return _apply_project_upload_result(pid, result)
 
