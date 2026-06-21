@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MemoryRouter } from 'react-router-dom'
@@ -185,7 +185,28 @@ const emptyModelsCatalog = {
     target_dir: '/tmp/anima/cltagger',
     current_model_path: 'cl_tagger_1_02/model.onnx',
     current_tag_mapping_path: 'cl_tagger_1_02/tag_mapping.json',
-    variants: [],
+    variants: [
+      {
+        label: 'cl_tagger_1_02',
+        model_id: 'cella110n/cl_tagger',
+        model_path: 'cl_tagger_1_02/model.onnx',
+        tag_mapping_path: 'cl_tagger_1_02/tag_mapping.json',
+        is_current: true,
+        exists: false,
+        size: 0,
+        files: [],
+      },
+      {
+        label: 'cl_tagger_v2_v2_01a',
+        model_id: 'cella110n/cl_tagger_v2',
+        model_path: 'v2_01a/model.onnx',
+        tag_mapping_path: 'v2_01a/model_vocabulary.json',
+        is_current: false,
+        exists: false,
+        size: 0,
+        files: [],
+      },
+    ],
   },
   download_source_options: {
     training: { current: 'huggingface', available: ['huggingface', 'modelscope'] },
@@ -350,5 +371,73 @@ describe('SettingsPage (PP0)', () => {
     expect(screen.getByText('Requests/sec')).toBeInTheDocument()
     expect(screen.getByText('Max/min')).toBeInTheDocument()
     expect(screen.getAllByText('0 = no limit').length).toBeGreaterThanOrEqual(2)
+  })
+
+
+  it('selecting CLTagger v2 updates model id and versioned file paths', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: '打标' }))
+    const v2Row = screen.getByText('cl_tagger_v2_v2_01a').closest('li')
+    expect(v2Row).not.toBeNull()
+    await user.click(within(v2Row as HTMLElement).getByRole('radio'))
+    await user.click(screen.getByRole('button', { name: '保存' }))
+
+    await waitFor(() => {
+      const putCall = fetchMock.mock.calls.find(
+        ([, init]) => init?.method === 'PUT'
+      )
+      expect(putCall).toBeDefined()
+      const body = JSON.parse(String(putCall![1].body))
+      expect(body.cltagger).toMatchObject({
+        model_id: 'cella110n/cl_tagger_v2',
+        model_path: 'v2_01a/model.onnx',
+        tag_mapping_path: 'v2_01a/model_vocabulary.json',
+      })
+    })
+  })
+
+  it('switching CLTagger variant stashes the leaving version local_dir per label', async () => {
+    // v1 起始带一个自定义 local_dir：切到 v2 时应把它暂存到
+    // variant_local_dirs['cl_tagger_1_02']，而 v2（无记忆）回到自动下载（null）。
+    const v1Custom = {
+      ...initialServerState,
+      cltagger: { ...initialServerState.cltagger, local_dir: '/custom/v1' },
+    }
+    fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+      if (init?.method === 'PUT') {
+        const body = JSON.parse(String(init.body)) as Record<string, Record<string, unknown>>
+        const merged = JSON.parse(JSON.stringify(v1Custom))
+        for (const k of Object.keys(body)) Object.assign(merged[k], body[k])
+        return Promise.resolve(new Response(JSON.stringify(merged), { status: 200 }))
+      }
+      if (typeof url === 'string' && url.includes('/api/models/catalog')) {
+        return Promise.resolve(new Response(JSON.stringify(emptyModelsCatalog), { status: 200 }))
+      }
+      if (typeof url === 'string' && url.includes('/api/wd14/runtime')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          installed: 'onnxruntime', version: '1.18.0', providers: ['CPUExecutionProvider'],
+          cuda_available: false, cuda_detect: { available: false, driver_version: null, gpu_name: null },
+        }), { status: 200 }))
+      }
+      return Promise.resolve(new Response(JSON.stringify(v1Custom), { status: 200 }))
+    })
+
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: '打标' }))
+    const v2Row = screen.getByText('cl_tagger_v2_v2_01a').closest('li')
+    await user.click(within(v2Row as HTMLElement).getByRole('radio'))
+    await user.click(screen.getByRole('button', { name: '保存' }))
+
+    await waitFor(() => {
+      const putCall = fetchMock.mock.calls.find(([, init]) => init?.method === 'PUT')
+      expect(putCall).toBeDefined()
+      const body = JSON.parse(String(putCall![1].body))
+      expect(body.cltagger.variant_local_dirs).toMatchObject({ cl_tagger_1_02: '/custom/v1' })
+      expect(body.cltagger.local_dir).toBeNull()
+      expect(body.cltagger.model_id).toBe('cella110n/cl_tagger_v2')
+    })
   })
 })

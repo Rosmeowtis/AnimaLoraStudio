@@ -227,6 +227,7 @@ export interface CLTaggerConfig {
   model_path: string
   tag_mapping_path: string
   local_dir: string | null
+  variant_local_dirs: Record<string, string>
   threshold_general: number
   threshold_character: number
   add_copyright_tag: boolean
@@ -522,9 +523,13 @@ export interface WD14Catalog {
 
 export interface CLTaggerVariantInfo {
   label: string
+  model_id: string
   model_path: string
   tag_mapping_path: string
+  description?: string
   is_current: boolean
+  target_path?: string
+  version_dir?: string
   exists: boolean
   size: number
   files: Array<{ name: string; exists: boolean; size: number; mtime: number }>

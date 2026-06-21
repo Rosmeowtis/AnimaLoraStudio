@@ -28,6 +28,7 @@ from .paths import (
     WD14_FILES,
     anima_main_target,
     anima_vae_target,
+    cltagger_required_files,
     cltagger_target_root,
     models_root,
     qwen_dir,
@@ -95,21 +96,35 @@ def build_catalog(root: Optional[Path] = None) -> dict[str, Any]:
             "files": files,
         })
 
-    # CLTagger 版本预设（CLTAGGER_VERSIONS 写死的子目录布局）。
+    # CLTagger 版本预设（每个 variant 可以来自不同 HF repo）。
     cl_root = cltagger_target_root(r, cl_cfg.model_id)
     cl_variants = []
-    for label, (mp, tmp) in CLTAGGER_VERSIONS.items():
+    for label, preset in CLTAGGER_VERSIONS.items():
+        mid = preset["model_id"]
+        mp = preset["model_path"]
+        tmp = preset["tag_mapping_path"]
+        variant_root = cltagger_target_root(r, mid)
+        version_dir = variant_root / Path(mp).parent
         files = [
-            {"name": mp, **_file_status(cl_root / mp)},
-            {"name": tmp, **_file_status(cl_root / tmp)},
+            {"name": f, **_file_status(variant_root / f)}
+            for f in cltagger_required_files(mp, tmp)
         ]
         all_exist = all(f["exists"] for f in files)
         total_size = sum(f["size"] for f in files)
         cl_variants.append({
             "label": label,
+            "model_id": mid,
             "model_path": mp,
             "tag_mapping_path": tmp,
-            "is_current": cl_cfg.model_path == mp and cl_cfg.tag_mapping_path == tmp,
+            "description": preset.get("description", ""),
+            # target_path = repo 本地根；version_dir = 该版本子目录（UI 提示文件落点）。
+            "target_path": str(variant_root),
+            "version_dir": str(version_dir),
+            "is_current": (
+                cl_cfg.model_id == mid
+                and cl_cfg.model_path == mp
+                and cl_cfg.tag_mapping_path == tmp
+            ),
             "exists": all_exist,
             "size": total_size,
             "files": files,

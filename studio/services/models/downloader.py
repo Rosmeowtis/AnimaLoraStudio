@@ -36,6 +36,8 @@ from .paths import (
     WD14_FILES,
     anima_main_target,
     anima_vae_target,
+    cltagger_canonical_file_paths,
+    cltagger_required_files,
     cltagger_target_root,
     models_root,
     qwen_dir,
@@ -149,10 +151,15 @@ def download_cltagger(
     on_log: Callable[[str], None] = print,
 ) -> bool:
     cfg = cfg or secrets.load().cltagger
+    model_path, tag_mapping_path = cltagger_canonical_file_paths(
+        cfg.model_id,
+        cfg.model_path,
+        cfg.tag_mapping_path,
+    )
     on_log(f"\n📥 CLTagger → {target_root}")
     target_root.mkdir(parents=True, exist_ok=True)
     ok = True
-    for f in (cfg.model_path, cfg.tag_mapping_path):
+    for f in cltagger_required_files(model_path, tag_mapping_path):
         if not _sources.download_flat(cfg.model_id, f, target_root / f, on_log=on_log):
             ok = False
     return ok
@@ -292,6 +299,21 @@ def get_status_snapshot() -> dict[str, dict[str, Any]]:
         }
 
 
+def _failure_summary(log: list[str]) -> str:
+    """从下载日志里提取一句可操作的失败原因（给前端 toast / message 用）。
+
+    download_flat 把错误写成 `   ✗ ...`；gated / 授权类失败再追加 `   ↳ ...提示`
+    （含 token / 申请授权指引）。优先返回带提示的那条，否则退回最后一条 ✗ 错误，
+    都没有再退到通用串。避免前端只看到 badge 红了却不知为何（原因只在终端 / 折叠
+    日志里）。
+    """
+    err = next((ln.strip() for ln in reversed(log) if ln.lstrip().startswith("✗")), "")
+    hint = next((ln.strip() for ln in reversed(log) if "↳" in ln), "")
+    if hint:
+        return f"{err} {hint}".strip() if err else hint
+    return err or "下载失败，详见下载日志"
+
+
 def start_download_async(
     key: str, fn: Callable[[Callable[[str], None]], bool]
 ) -> DownloadStatus:
@@ -331,7 +353,7 @@ def start_download_async(
                 ds.status = "done" if ok else "failed"
                 ds.finished_at = time.time()
                 if not ok:
-                    ds.message = "下载失败，看 log_tail"
+                    ds.message = _failure_summary(ds.log)
         except Exception as exc:
             with _LOCK:
                 ds.status = "failed"
@@ -393,19 +415,24 @@ def trigger(model_id: str, variant: Optional[str] = None) -> str:
         return key
     if model_id == "cltagger":
         cfg = secrets.load().cltagger
-        target = cltagger_target_root(root, cfg.model_id)
-        # variant 可指定预设 label（覆盖 cfg 当前的 model_path），便于 UI 一键
+        # variant 可指定预设 label（覆盖 cfg 当前的 repo/path），便于 UI 一键
         # 下载非"当前选中"的版本。未指定时用 cfg 当前路径。
         if variant:
             preset = CLTAGGER_VERSIONS.get(variant)
             if preset is None:
                 raise ValueError(f"unknown cltagger variant {variant!r}")
             cfg = secrets.CLTaggerConfig(
-                **{**cfg.model_dump(), "model_path": preset[0], "tag_mapping_path": preset[1]}
+                **{
+                    **cfg.model_dump(),
+                    "model_id": preset["model_id"],
+                    "model_path": preset["model_path"],
+                    "tag_mapping_path": preset["tag_mapping_path"],
+                }
             )
             key = f"cltagger:{variant}"
         else:
             key = "cltagger"
+        target = cltagger_target_root(root, cfg.model_id)
         start_download_async(
             key, lambda log: download_cltagger(target, cfg, on_log=log)
         )
