@@ -31,10 +31,14 @@ def queue_checkpoint_eval(
     task: dict[str, Any],
     payload: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    """Queue eval_samples for a saved LoRA checkpoint when the POC switch is on."""
+    """Queue eval_samples for a saved LoRA checkpoint (checkpoint-trigger path).
+
+    Gated on the version's per-version opt-in (training config
+    ``eval_validation_enabled``) and the global ``auto_eval_trigger`` being
+    ``checkpoint``. This is the supervisor-side fallback for when inline eval
+    cannot run inside the training process (see ``run_checkpoint_eval_for_task``).
+    """
     cfg = secrets.load().eval_metrics
-    if not cfg.auto_eval_on_checkpoint:
-        return None
     if cfg.auto_eval_trigger != "checkpoint":
         return None
 
@@ -48,6 +52,8 @@ def queue_checkpoint_eval(
     if not version or int(version["project_id"]) != project_id:
         return None
     if not project:
+        return None
+    if not _version_eval_enabled(project, version):
         return None
 
     checkpoint = _checkpoint_relative_to_output(
@@ -69,7 +75,6 @@ def queue_checkpoint_eval(
             version,
             vdir,
             checkpoint_path=checkpoint,
-            max_items=cfg.auto_eval_max_items,
             auto_metrics=True,
             auto_source={
                 "task_id": int(task.get("id") or 0),
@@ -110,10 +115,13 @@ def run_checkpoint_eval_for_task(
     This path is used for auto eval during training. It intentionally does not
     create project_jobs, because the training task itself owns the GPU and must
     wait for the eval result before continuing to the next epoch/step.
+
+    Gated on the version's per-version opt-in (training config
+    ``eval_validation_enabled``) and the global ``auto_eval_trigger`` being
+    ``checkpoint``. Returns ``None`` when not applicable so the caller may fall
+    back to the supervisor event path.
     """
     cfg = secrets.load().eval_metrics
-    if not cfg.auto_eval_on_checkpoint:
-        return None
     if cfg.auto_eval_trigger != "checkpoint":
         return None
 
@@ -126,6 +134,8 @@ def run_checkpoint_eval_for_task(
         if resolved is None:
             return None
         project, version, vdir, checkpoint = resolved
+        if not _version_eval_enabled(project, version):
+            return None
 
     auto_source = {
         "task_id": int(task_id),
@@ -144,7 +154,6 @@ def run_checkpoint_eval_for_task(
         version,
         vdir,
         checkpoint_path=checkpoint,
-        max_items=cfg.auto_eval_max_items,
         auto_metrics=True,
         auto_source=auto_source,
         eval_root=eval_root,
@@ -193,9 +202,12 @@ def queue_training_finished_eval(
     """Queue eval sample jobs for all saved LoRA checkpoints after training.
 
     Gated on the version's per-version opt-in (training config
-    ``eval_validation_enabled``); the held-out validation set is the reference.
+    ``eval_validation_enabled``) and the global ``auto_eval_trigger`` being
+    ``after_training``; the held-out validation set is the reference.
     """
     cfg = secrets.load().eval_metrics
+    if cfg.auto_eval_trigger != "after_training":
+        return []
 
     project_id = int(task.get("project_id") or 0)
     version_id = int(task.get("version_id") or 0)
@@ -230,7 +242,6 @@ def queue_training_finished_eval(
                 version,
                 vdir,
                 checkpoint_path=rel,
-                max_items=cfg.auto_eval_max_items,
                 auto_metrics=True,
                 auto_source={
                     "task_id": int(task.get("id") or 0),
@@ -261,20 +272,15 @@ def queue_manual_task_eval(
     conn,
     task: dict[str, Any],
     checkpoints: list[str],
-    *,
-    max_items: int | None = None,
 ) -> list[tuple[dict[str, Any], dict[str, Any]]]:
     """Queue task-scoped eval sample+metric jobs for an explicit checkpoint set.
 
     Unlike :func:`queue_training_finished_eval` / :func:`queue_checkpoint_eval`,
     this is the *manual* entry point (a user clicking "运行评估" on a finished
-    task), so it does NOT gate on ``auto_eval_on_checkpoint`` / ``auto_eval_trigger``.
-    It still reuses the Settings defaults for sample count and metric models, and
-    writes under ``tasks/<id>/eval/`` so results show up in that task's eval page.
+    task), so it does NOT gate on the per-version opt-in or ``auto_eval_trigger``.
+    It evaluates the full validation set and reuses the Settings metric models,
+    writing under ``tasks/<id>/eval/`` so results show up in that task's eval page.
     """
-    cfg = secrets.load().eval_metrics
-    items = max_items if max_items is not None else cfg.auto_eval_max_items
-
     project_id = int(task.get("project_id") or 0)
     version_id = int(task.get("version_id") or 0)
     task_id = int(task.get("id") or 0)
@@ -304,7 +310,6 @@ def queue_manual_task_eval(
                 version,
                 vdir,
                 checkpoint_path=rel,
-                max_items=items,
                 auto_metrics=True,
                 auto_source={"task_id": task_id, "trigger": "manual"},
                 eval_root=eval_root,

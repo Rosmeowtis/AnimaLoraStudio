@@ -73,13 +73,15 @@ type Section =
   | 'generate'
   | 'proxy'
 
+type AutoEvalTrigger = 'after_training' | 'checkpoint'
+
 type Tab = 'dataset' | 'tagging' | 'preprocess' | 'training' | 'monitor' | 'testing' | 'credentials' | 'appearance' | 'system'
 
 // 外部页面通过 `?section=<id>` 跳转到 SettingsPage 的特定 section 时，用这个
 // 反向映射决定要先切到哪个 tab。只列出能从外部链接到的 sections。
 const SECTION_TO_TAB: Record<string, Tab> = {
   'models': 'training',
-  'eval-metrics': 'training',
+  'eval-metrics': 'monitor',
   'version': 'system',
   'service': 'system',
 }
@@ -115,7 +117,6 @@ const TAB_SECTIONS: Record<Tab, { id: string; labelKey: string }[]> = {
     { id: 'tag-dictionary', labelKey: 'settings.tagDictionary.title' },
   ],
   training: [
-    { id: 'eval-metrics', labelKey: 'settings.evalMetricModels' },
     { id: 'queue', labelKey: 'settings.queueSchedule' },
     { id: 'training-params', labelKey: 'settings.trainingParams' },
     { id: 'pytorch', labelKey: 'settings.torch' },
@@ -124,6 +125,7 @@ const TAB_SECTIONS: Record<Tab, { id: string; labelKey: string }[]> = {
     { id: 'models', labelKey: 'settings.trainingModels' },
   ],
   monitor: [
+    { id: 'eval-metrics', labelKey: 'settings.evalMetrics' },
     { id: 'wandb', labelKey: 'settings.wandb' },
   ],
   testing: [
@@ -242,9 +244,7 @@ const EMPTY: Secrets = {
   eval_metrics: {
     clip_model_name: 'openai/clip-vit-base-patch32',
     dino_model_name: 'facebook/dinov2-small',
-    auto_eval_on_checkpoint: false,
     auto_eval_trigger: 'after_training',
-    auto_eval_max_items: 1,
   },
   download_source: 'huggingface',
   download_sources: {},
@@ -921,43 +921,6 @@ export default function SettingsPage() {
       </>)}
 
       {tab === 'training' && (<>
-      <SettingsSection id="eval-metrics" title={t('settings.evalMetricModels')}>
-        <p className="text-xs text-fg-tertiary">{t('settings.evalMetricModelsHint')}</p>
-        <SettingsField
-          label={t('settings.autoEvalMaxItems')}
-          helpTooltip={<p>{t('settings.autoEvalMaxItemsHelp')}</p>}
-        >
-          <input
-            type="number"
-            min={1}
-            max={256}
-            value={draft.eval_metrics.auto_eval_max_items}
-            onChange={(e) => update('eval_metrics', 'auto_eval_max_items', Math.max(1, Math.min(256, parseInt(e.target.value) || 1)))}
-            className={textInputClass}
-          />
-        </SettingsField>
-        <SettingsField
-          label={t('settings.evalClipModel')}
-          helpTooltip={<p>{t('settings.evalClipModelHelp')}</p>}
-        >
-          <input
-            value={draft.eval_metrics.clip_model_name}
-            onChange={(e) => update('eval_metrics', 'clip_model_name', e.target.value)}
-            className={textInputClass}
-          />
-        </SettingsField>
-        <SettingsField
-          label={t('settings.evalDinoModel')}
-          helpTooltip={<p>{t('settings.evalDinoModelHelp')}</p>}
-        >
-          <input
-            value={draft.eval_metrics.dino_model_name}
-            onChange={(e) => update('eval_metrics', 'dino_model_name', e.target.value)}
-            className={textInputClass}
-          />
-        </SettingsField>
-      </SettingsSection>
-
       <SettingsSection id="queue" title={t('settings.queueSchedule')}>
         <SettingsField
           label={t('settings.allowGpuDuringTrain')}
@@ -987,6 +950,43 @@ export default function SettingsPage() {
       </>)}
 
       {tab === 'monitor' && (<>
+      <SettingsSection id="eval-metrics" title={t('settings.evalMetrics')}>
+        <p className="text-xs text-fg-tertiary">{t('settings.evalMetricModelsHint')}</p>
+        <SourceSelect
+          opt={catalog?.download_source_options?.eval}
+          onChange={(s) => void setDownloadSource('eval', s)}
+        />
+        <EvalMetricModelCard
+          catalog={catalog} busy={downloadBusy} start={startDownload}
+          kind="clip" dlId="eval_clip"
+          titleKey="settings.evalClipModel" helpKey="settings.evalClipModelHelp"
+          modelId={draft.eval_metrics.clip_model_name}
+          onModelIdChange={(id) => update('eval_metrics', 'clip_model_name', id)}
+          t={t}
+        />
+        <EvalMetricModelCard
+          catalog={catalog} busy={downloadBusy} start={startDownload}
+          kind="dino" dlId="eval_dino"
+          titleKey="settings.evalDinoModel" helpKey="settings.evalDinoModelHelp"
+          modelId={draft.eval_metrics.dino_model_name}
+          onModelIdChange={(id) => update('eval_metrics', 'dino_model_name', id)}
+          t={t}
+        />
+        <SettingsField
+          label={t('settings.autoEvalTrigger')}
+          helpTooltip={<p>{t('settings.autoEvalTriggerHelp')}</p>}
+        >
+          <select
+            value={draft.eval_metrics.auto_eval_trigger}
+            onChange={(e) => update('eval_metrics', 'auto_eval_trigger', e.target.value as AutoEvalTrigger)}
+            className={textInputClass}
+          >
+            <option value="after_training">{t('settings.autoEvalTriggerAfterTraining')}</option>
+            <option value="checkpoint">{t('settings.autoEvalTriggerCheckpoint')}</option>
+          </select>
+        </SettingsField>
+      </SettingsSection>
+
       <SettingsSection id="wandb" title="Weights & Biases">
         <SettingsField label={t('settings.enableWandb')} desc={t('settings.enableWandbHint')}>
           <Bool value={draft.wandb.enabled} onChange={(v) => update('wandb', 'enabled', v)} />
@@ -1696,6 +1696,63 @@ function WD14ModelCard({
           ids={candidates} currentId={currentModelId}
           onChange={onCandidatesChange}
         />
+      )}
+    </ModelGroupCard>
+  )
+}
+
+function EvalMetricModelCard({
+  catalog, busy, start, kind, dlId, titleKey, helpKey, modelId, onModelIdChange, t,
+}: {
+  catalog: ModelsCatalog | null
+  busy: Set<string>
+  start: (model_id: string, variant?: string) => Promise<void>
+  kind: 'clip' | 'dino'
+  dlId: 'eval_clip' | 'eval_dino'
+  titleKey: string
+  helpKey: string
+  modelId: string
+  onModelIdChange: (id: string) => void
+  t: TFunction
+}) {
+  const [advOpen, setAdvOpen] = useState(false)
+  const em = catalog?.eval_metrics
+  if (!em) {
+    return <p className="text-fg-tertiary text-xs">{t('settings.loadingModelCatalog')}</p>
+  }
+  const variant = em.variants.find((x) => x.kind === kind)
+  const key = `${dlId}:${modelId}`
+  const dl = catalog.downloads[key]
+  // catalog 的 exists 按已保存的 model_id 算；草稿改了未保存时按未下载显示。
+  const exists = variant?.model_id === modelId ? !!variant?.exists : false
+  return (
+    <ModelGroupCard title={t(titleKey)} helpTooltip={<p>{t(helpKey)}</p>}>
+      <div className="flex items-center gap-2 text-xs">
+        <code className="font-mono text-fg-primary min-w-0 overflow-hidden text-ellipsis whitespace-nowrap">{modelId}</code>
+        {variant?.size_estimate ? (
+          <span className="text-fg-tertiary shrink-0">~{fmtBytes(variant.size_estimate)}</span>
+        ) : null}
+        <span style={{ flex: 1 }} />
+        <ModelStatusBadge exists={exists} size={variant?.size ?? 0} status={dl?.status} />
+        <DownloadButton
+          exists={exists} status={dl?.status} busy={busy.has(key)}
+          onClick={() => void start(dlId, modelId)}
+        />
+      </div>
+      <button type="button" onClick={() => setAdvOpen(!advOpen)}
+        className="btn btn-ghost btn-sm text-xs text-fg-tertiary self-start">
+        {advOpen ? '▾' : '▸'} {t('settings.customRepoAdvanced')}
+      </button>
+      {advOpen && (
+        <SettingsField label={t('settings.fieldModelId')}>
+          <input
+            type="text"
+            value={modelId}
+            onChange={(e) => onModelIdChange(e.target.value)}
+            className={textInputClass}
+            placeholder={t('settings.addHfModelId')}
+          />
+        </SettingsField>
       )}
     </ModelGroupCard>
   )

@@ -162,12 +162,8 @@ export interface EvalMetricModelsConfig {
   clip_model_name: string
   /** DINO-I 默认模型名或本地目录。 */
   dino_model_name: string
-  /** Enable automatic eval jobs for saved training LoRA checkpoints. */
-  auto_eval_on_checkpoint: boolean
-  /** When automatic eval runs. */
+  /** When auto eval runs (per-version enabled gates whether it runs at all). */
   auto_eval_trigger: 'after_training' | 'checkpoint'
-  /** Cap generated eval samples per automatically queued checkpoint. */
-  auto_eval_max_items: number
 }
 
 export interface EvalMetricSpec {
@@ -633,6 +629,23 @@ export interface CLTaggerCatalog {
   variants: CLTaggerVariantInfo[]
 }
 
+export interface EvalVariantInfo {
+  kind: 'clip' | 'dino'
+  model_id: string
+  target_path: string
+  exists: boolean
+  size: number
+  /** 下载前的预估大小（bytes）；未知 model_id 为 0。 */
+  size_estimate: number
+}
+
+export interface EvalMetricsCatalog {
+  id: 'eval_metrics'
+  name: string
+  description: string
+  variants: EvalVariantInfo[]
+}
+
 export interface ModelDownloadStatus {
   key: string
   status: 'pending' | 'running' | 'done' | 'failed'
@@ -677,6 +690,7 @@ export interface ModelsCatalog {
   t5_tokenizer: ModelDirCatalog
   wd14: WD14Catalog
   cltagger: CLTaggerCatalog
+  eval_metrics?: EvalMetricsCatalog
   upscalers?: UpscalersCatalog
   /** 按类型的下载源选项：current = 当前选中，available = 可选源（长度 1 = 固定单源）。 */
   download_source_options: Record<string, { current: string; available: string[] }>
@@ -2745,7 +2759,7 @@ export const api = {
   runTaskEval: (
     pid: number,
     vid: number,
-    body: { task_id: number; checkpoints: string[]; max_items?: number },
+    body: { task_id: number; checkpoints: string[] },
   ) =>
     req<{ queued: number }>(
       `/api/projects/${pid}/versions/${vid}/eval/run`,

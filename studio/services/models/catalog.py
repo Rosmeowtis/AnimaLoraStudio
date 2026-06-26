@@ -30,6 +30,7 @@ from .paths import (
     anima_vae_target,
     cltagger_required_files,
     cltagger_target_root,
+    eval_model_target_dir,
     models_root,
     qwen_dir,
     selected_upscaler,
@@ -43,6 +44,19 @@ from .paths import (
 # ---------------------------------------------------------------------------
 # catalog
 # ---------------------------------------------------------------------------
+
+
+# CLIP / DINO 常见模型的下载大小预估（bytes，约值）。下载前给用户一个体量参考；
+# 未知 model_id 不显示预估。已下载后 UI 用实际目录大小。
+_EVAL_SIZE_ESTIMATES = {
+    "openai/clip-vit-base-patch32": 605_000_000,
+    "openai/clip-vit-base-patch16": 599_000_000,
+    "openai/clip-vit-large-patch14": 1_710_000_000,
+    "facebook/dinov2-small": 88_000_000,
+    "facebook/dinov2-base": 346_000_000,
+    "facebook/dinov2-large": 1_220_000_000,
+    "facebook/dinov2-giant": 4_600_000_000,
+}
 
 
 def _file_status(p: Path) -> dict[str, Any]:
@@ -89,7 +103,26 @@ def build_catalog(root: Optional[Path] = None) -> dict[str, Any]:
     t5_d = t5_tokenizer_dir(r)
     cl_cfg = secrets.load().cltagger
     wd14_cfg = secrets.load().wd14
+    eval_cfg = secrets.load().eval_metrics
     src_cfg = secrets.load().download_sources
+
+    # CLIP / DINO eval 指标模型：各一行 variant，整目录有 config.json 即"已下载"。
+    eval_variants = []
+    for kind, mid in (("clip", eval_cfg.clip_model_name), ("dino", eval_cfg.dino_model_name)):
+        target = eval_model_target_dir(r, kind, mid)
+        exists = (target / "config.json").exists()
+        size = (
+            sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
+            if target.exists() else 0
+        )
+        eval_variants.append({
+            "kind": kind,
+            "model_id": mid,
+            "target_path": str(target),
+            "exists": exists,
+            "size": size,
+            "size_estimate": _EVAL_SIZE_ESTIMATES.get(mid, 0),
+        })
 
     # WD14 候选每个 model_id 一行：两文件全在才算"已下载"。
     wd14_variants = []
@@ -245,6 +278,12 @@ def build_catalog(root: Optional[Path] = None) -> dict[str, Any]:
             "current_tag_mapping_path": cl_cfg.tag_mapping_path,
             "variants": cl_variants,
         },
+        "eval_metrics": {
+            "id": "eval_metrics",
+            "name": "评估指标模型",
+            "description": "CLIP / DINO，用于 LoRA 训练后指标评估",
+            "variants": eval_variants,
+        },
         "upscalers": {
             "id": "upscalers",
             "name": "放大器",
@@ -261,6 +300,8 @@ def build_catalog(root: Optional[Path] = None) -> dict[str, Any]:
             "training": {"current": src_cfg.get("training", "huggingface"),
                          "available": ["huggingface", "modelscope"]},
             "wd14": {"current": src_cfg.get("wd14", "huggingface"),
+                     "available": ["huggingface", "modelscope"]},
+            "eval": {"current": src_cfg.get("eval", "huggingface"),
                      "available": ["huggingface", "modelscope"]},
             "upscaler": {"current": src_cfg.get("upscaler", "huggingface"),
                          "available": ["huggingface", "modelscope"]},
