@@ -401,6 +401,12 @@ export default function RegularizationPage() {
           lines: aiLogs,
           startedAt: aiTask.started_at,
           finishedAt: aiTask.finished_at,
+          onCancel: () => {
+            void api
+              .cancelTask(aiTask.id)
+              .then(() => toast(t('reg.cancelToast'), 'success'))
+              .catch((e) => toast(String(e), 'error'))
+          },
         },
       ]}
       actions={
@@ -526,6 +532,8 @@ export default function RegularizationPage() {
         <ImagePreviewModal
           src={regOrigUrl(project.id, vid, reg.files[previewIdx])}
           caption={previewCaption}
+          index={previewIdx}
+          total={reg.files.length}
           hasPrev={previewIdx > 0}
           hasNext={previewIdx < reg.files.length - 1}
           onClose={() => setPreviewIdx(null)}

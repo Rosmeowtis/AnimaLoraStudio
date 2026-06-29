@@ -157,6 +157,111 @@ export interface ModelScopeConfig {
   token: string
 }
 
+export interface EvalMetricModelsConfig {
+  /** CLIP-T / CLIP-I 默认模型名或本地目录。 */
+  clip_model_name: string
+  /** DINO-I 默认模型名或本地目录。 */
+  dino_model_name: string
+  /** CCIP（anime 角色身份）默认 ONNX 变体名。 */
+  ccip_model_name: string
+  /** 启用哪些评估指标（Settings 复选框）；eval 只算勾选的。 */
+  enabled_metrics: string[]
+  /** 训练后评估额外出一组纯底模(scale=0)对照，各指标给 Δ = checkpoint − baseline。 */
+  eval_baseline_enabled: boolean
+}
+
+/** 评估指标 registry 条目（catalog.eval_metric_catalog）：Settings 复选框列表用。 */
+export interface EvalMetricCatalogItem {
+  key: string
+  label: string
+  runner: string
+  models: string[]
+  default: boolean
+  desc: string
+  note: string
+}
+
+export interface EvalMetricSpec {
+  key: string
+  label: string
+  question: string
+  requires: string[]
+  higher_is_better: boolean
+}
+
+export interface EvalMetricState {
+  key: string
+  label?: string
+  status: 'not_run' | 'pending' | 'running' | 'done' | 'failed' | 'unavailable' | string
+  value: number | null
+  reason?: string
+  question?: string
+  requires?: string[]
+  higher_is_better?: boolean
+  count?: number
+  model_name?: string
+  job_id?: number
+}
+
+export interface EvalMetricResult {
+  schema_version: number
+  has_metrics: boolean
+  status: string
+  run_id: string
+  project_id?: number
+  project_slug?: string
+  version_id?: number
+  version_label?: string
+  created_at?: number | null
+  updated_at?: number | null
+  manifest_digest?: string
+  checkpoint?: {
+    kind?: string
+    label?: string
+    path?: string
+    value?: number
+    mtime?: number
+  }
+  metrics: Record<string, unknown>
+  metric_states: Record<string, EvalMetricState>
+  summary?: Record<string, number>
+  /** 纯底模(lora_scale=0)对照 run；不作为 checkpoint 展示，只供算 Δ。 */
+  baseline?: boolean
+  /** 各指标相对 baseline 的净增益 Δ = checkpoint 值 − baseline 值。 */
+  delta?: Record<string, number>
+  /** baseline 各指标值（参考）。 */
+  baseline_metrics?: Record<string, number>
+  /** 出图阶段（eval_samples run.json）的状态 + 逐图汇总 {total, pending, running,
+   *  done, failed}。出图是评估里最耗时的部分；用它显示「出图 done/total」子进度。 */
+  sample_run?: {
+    run_id: string
+    path?: string
+    status: string
+    summary: Record<string, number>
+    created_at?: number | null
+    updated_at?: number | null
+  }
+}
+
+/** 训练后 / 手动评估的一条 job（inline 训练时评估无 job）。按 run_id 关联到某个
+ *  checkpoint 行，用来取原始日志（含报错）。 */
+export interface EvalJobInfo {
+  id: number
+  kind: 'eval_samples' | 'eval_clip' | 'eval_dino' | string
+  status: string
+  run_id?: string | null
+  checkpoint_path?: string | null
+}
+
+export interface EvalMetricsListResponse {
+  metric_specs: EvalMetricSpec[]
+  cache: {
+    embeddings_dir: string
+    entries: Array<{ key: string; path: string; file_count: number; size_bytes: number }>
+  }
+  results: EvalMetricResult[]
+}
+
 /** Preset messages 序列里的单条 item。
  *  - type='text'：普通文本，需指定 role；content 是 prompt 内容
  *  - type='image'：图片占位 item，打标时后端塞入当前图片；UI 不可编辑 content，但可拖动位置
@@ -449,6 +554,7 @@ export interface Secrets {
   huggingface: HuggingFaceConfig
   wandb: WandBConfig
   modelscope: ModelScopeConfig
+  eval_metrics: EvalMetricModelsConfig
   /** 旧的全局下载源（已退役为迁移种子，无 UI）。新模型按类型在 download_sources 里各自选。 */
   download_source: string
   /** 按类型下载源：{training|wd14|upscaler: 'huggingface'|'modelscope'}。固定 HF 的类型不在内。 */
@@ -564,6 +670,23 @@ export interface CLTaggerCatalog {
   variants: CLTaggerVariantInfo[]
 }
 
+export interface EvalVariantInfo {
+  kind: 'clip' | 'dino'
+  model_id: string
+  target_path: string
+  exists: boolean
+  size: number
+  /** 下载前的预估大小（bytes）；未知 model_id 为 0。 */
+  size_estimate: number
+}
+
+export interface EvalMetricsCatalog {
+  id: 'eval_metrics'
+  name: string
+  description: string
+  variants: EvalVariantInfo[]
+}
+
 export interface ModelDownloadStatus {
   key: string
   status: 'pending' | 'running' | 'done' | 'failed'
@@ -608,6 +731,9 @@ export interface ModelsCatalog {
   t5_tokenizer: ModelDirCatalog
   wd14: WD14Catalog
   cltagger: CLTaggerCatalog
+  eval_metrics?: EvalMetricsCatalog
+  /** 评估指标 registry（Settings 复选框列表）。 */
+  eval_metric_catalog?: EvalMetricCatalogItem[]
   upscalers?: UpscalersCatalog
   /** 按类型的下载源选项：current = 当前选中，available = 可选源（长度 1 = 固定单源）。 */
   download_source_options: Record<string, { current: string; available: string[] }>
@@ -844,11 +970,26 @@ export interface CurationItem {
 }
 
 export interface CurationView {
-  left: CurationItem[] // download − train
+  left: CurationItem[] // download − train − validation
   right: Record<string, CurationItem[]> // folder → items
   download_total: number
   train_total: number
   folders: string[]
+}
+
+/** held-out 验证集里的一张图：扁平列表（无文件夹概念），但带物理 `folder`
+ *  供缩略图寻址（version thumb 的 validation bucket 需要）与精确删除。 */
+export interface ValidationItem {
+  name: string
+  mtime: number
+  folder: string
+}
+
+export interface CurationValidationView {
+  left: CurationItem[] // download − train − validation（与训练集同候选池）
+  right: ValidationItem[] // validation 全量扁平
+  download_total: number
+  val_total: number
 }
 
 export interface CopyResult {
@@ -1402,6 +1543,11 @@ export interface LogResponse {
 
 /** /api/state — per-task monitor state written by the training process */
 export interface MonitorState {
+  task_id?: number
+  project_id?: number
+  project_slug?: string
+  version_id?: number
+  version_label?: string
   step?: number
   total_steps?: number
   epoch?: number
@@ -1705,6 +1851,16 @@ export interface ModelsRootMigrateStatus {
   done_bytes: number
   current_file: string
   error: string
+}
+
+export interface AnnouncementPost {
+  id: string
+  date: string
+  tag: 'release' | 'notice' | 'migration'
+  title: { zh: string; en: string }
+  body: { zh: string; en: string }
+  pin: boolean
+  version: string | null
 }
 
 export const api = {
@@ -2172,6 +2328,11 @@ export const api = {
        * 第一个 tag，并同步落库到 version.trigger_word，后续 train 读出。
        */
       trigger_word?: string
+      /**
+       * 打标范围：'all'（默认，train 全部 + validation）/ 'validation'（只打
+       * held-out 验证集）/ 某个 train 子文件夹名（只打那一个）。
+       */
+      scope?: string
     }
   ) =>
     req<Job>(`/api/projects/${pid}/versions/${vid}/tag`, {
@@ -2405,6 +2566,25 @@ export const api = {
       `/api/projects/${pid}/versions/${vid}/curation/folder`,
       { method: 'POST', body: JSON.stringify(body) }
     ),
+  // 验证集（held-out）手动维护——与 train curation 对称，右栏扁平无文件夹
+  getCurationValidation: (pid: number, vid: number) =>
+    req<CurationValidationView>(
+      `/api/projects/${pid}/versions/${vid}/curation/validation`
+    ),
+  copyToValidation: (pid: number, vid: number, body: { files: string[] }) =>
+    req<CopyResult>(
+      `/api/projects/${pid}/versions/${vid}/curation/validation/copy`,
+      { method: 'POST', body: JSON.stringify(body) }
+    ),
+  removeFromValidation: (
+    pid: number,
+    vid: number,
+    body: { items: { folder: string; name: string }[] }
+  ) =>
+    req<{ removed: string[]; missing: string[] }>(
+      `/api/projects/${pid}/versions/${vid}/curation/validation/remove`,
+      { method: 'POST', body: JSON.stringify(body) }
+    ),
   // ADR 0010 train scope duplicates
   scanDuplicatesTrain: (
     pid: number,
@@ -2427,7 +2607,7 @@ export const api = {
   versionThumbUrl: (
     pid: number,
     vid: number,
-    bucket: 'train' | 'reg' | 'samples',
+    bucket: 'train' | 'reg' | 'samples' | 'validation',
     name: string,
     folder?: string,
     size: number = 256
@@ -2661,6 +2841,27 @@ export const api = {
     ),
   sampleImageUrl: (filename: string, taskId: number, w?: number) =>
     `/samples/${filename}?task_id=${taskId}${w ? `&w=${w}` : ''}`,
+  listEvalMetrics: (pid: number, vid: number, taskId?: number) =>
+    req<EvalMetricsListResponse>(
+      `/api/projects/${pid}/versions/${vid}/eval/metrics?` +
+      (taskId ? `task_id=${taskId}&` : '') +
+      `_=${Date.now()}`,
+    ),
+  /** 列某 task 的训练后/手动评估 job（按 run_id 关联 checkpoint 行 + 取原始日志）。 */
+  listTaskEvalJobs: (pid: number, vid: number, taskId: number) =>
+    req<{ jobs: EvalJobInfo[] }>(
+      `/api/projects/${pid}/versions/${vid}/eval/jobs?task_id=${taskId}`,
+    ),
+  /** 手动评估完成任务的选定 checkpoint（task-scoped，绕过自动评估开关）。 */
+  runTaskEval: (
+    pid: number,
+    vid: number,
+    body: { task_id: number; checkpoints: string[] },
+  ) =>
+    req<{ queued: number }>(
+      `/api/projects/${pid}/versions/${vid}/eval/run`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
 
   // Queue import / export ---------------------------------------------
   /** 队列导出直链。响应带 Content-Disposition: attachment,<a href download>
@@ -2733,6 +2934,8 @@ export const api = {
     const qs = new URLSearchParams({ channel, force: String(force) })
     return req<SystemUpdateCheck>(`/api/system/update_check?${qs.toString()}`)
   },
+  getAnnouncements: () =>
+    req<{ posts: AnnouncementPost[] }>('/api/announcements').then((r) => r.posts),
 
   // 请求 update：写 .update_pending + 触发 SIGINT 重启。
   // 422 = running task 或 dirty working tree（force=true 时跳过 dirty 闸，
@@ -2755,16 +2958,6 @@ export const api = {
 
   // 完整 .update_log 文本（PR-C，失败时 UI 弹 modal 用）。
   getSystemUpdateLog: () => req<{ content: string }>('/api/system/update_log'),
-
-  // chunk 2 — 解析 CHANGELOG.md，返回指定 tag 的 release notes
-  // （MasterCard 用此填进 change-block；缺失时 found=false 优雅退化）
-  getReleaseNotes: (tag: string) =>
-    req<ReleaseNotes>(`/api/system/release_notes?tag=${encodeURIComponent(tag)}`),
-
-  // yaml 内全部 release notes（latest first）。详情 modal 版本切换用，
-  // 一次拉完前端缓存在 modal 生命周期内导航；yaml 缺失 → versions=[]
-  getAllReleaseNotes: () =>
-    req<{ versions: ReleaseNotes[] }>('/api/system/release_notes_all'),
 
   // chunk 3 — git fetch + log origin/dev，返回最近 N 个 commit
   // （DevCard 时间线 + 任意 commit 切换用）。limit 默认 10，clamp 1-50。
@@ -2858,26 +3051,6 @@ export interface SystemUpdateStatus {
    *  --tags --exact-match 拿；commit 没打 tag → null。UI 优先显示 tag，
    *  fallback 到 sha 前 8 位 */
   rollback_target_tag?: string | null
-}
-
-/** chunk 2 重做 — release_notes.yaml 派生的 release notes。
- *  schema + 编写规范见 docs/release-notes-spec.md。`found=false` → UI 退化到 CHANGELOG 链接。 */
-export type ReleaseNotesKind =
-  | 'added' | 'changed' | 'improved' | 'fixed' | 'removed' | 'deprecated' | 'security'
-
-export interface ReleaseNotesEntry {
-  kind: ReleaseNotesKind
-  summary: string         // ≤ 80 chars, plain text, user-facing
-  pr_refs: number[]       // 关联 PR 号；空 list 表示无关联 PR
-  detail: string | null   // optional markdown 多行说明
-}
-
-export interface ReleaseNotes {
-  tag: string             // caller 传入的 tag（v 前缀保留）
-  found: boolean
-  date: string | null     // ISO YYYY-MM-DD
-  summary: string | null  // 整版本一句话总览（block-level summary）
-  entries: ReleaseNotesEntry[]
 }
 
 /** chunk 3 — dev 通道最近 commit 摘要。fetched=false 时表示 git fetch 失败

@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom'
 import {
   api,
+  type EvalJobInfo,
   type Task,
   type TaskOutputs,
   type TaskStatus,
@@ -11,9 +12,12 @@ import { PauseProgressModal } from '../components/PauseProgressModal'
 import { useDialog } from '../components/Dialog'
 import { useToast } from '../components/Toast'
 import { useEventStream } from '../lib/useEventStream'
-import MonitorDashboard from '../components/MonitorDashboard'
+import { useTaskEvalProgress } from '../lib/useEvalProgress'
+import MonitorDashboard, { EvalMetricsPanel } from '../components/MonitorDashboard'
+import TaskLogDrawer, { type LogSource, type LogSourceStatus } from '../components/TaskLogDrawer'
+import { useMonitorProgress } from '../lib/useMonitorProgress'
 
-type Tab = 'overview' | 'log' | 'monitor' | 'outputs' | 'snapshot'
+type Tab = 'overview' | 'log' | 'monitor' | 'eval' | 'outputs' | 'snapshot'
 
 const STATUS_BADGE: Record<TaskStatus, string> = {
   pending: 'badge badge-neutral',
@@ -93,7 +97,7 @@ export default function QueueDetailPage() {
   const [tab, setTab] = useState<Tab>(() => {
     if (typeof window === 'undefined') return 'overview'
     const v = window.location.hash.replace(/^#/, '')
-    return (['overview', 'log', 'monitor', 'outputs', 'snapshot'] as const).includes(v as Tab) ? (v as Tab) : 'overview'
+    return (['overview', 'log', 'monitor', 'eval', 'outputs', 'snapshot'] as const).includes(v as Tab) ? (v as Tab) : 'overview'
   })
   const [confirmDelete, setConfirmDelete] = useState(false)
   const [pauseModalOpen, setPauseModalOpen] = useState(false)
@@ -112,7 +116,7 @@ export default function QueueDetailPage() {
   // 写回不会更新 router state，所以两条 effect 不会 ping-pong。
   useEffect(() => {
     const v = location.hash.replace(/^#/, '')
-    if ((['overview', 'log', 'monitor', 'outputs', 'snapshot'] as const).includes(v as Tab)) {
+    if ((['overview', 'log', 'monitor', 'eval', 'outputs', 'snapshot'] as const).includes(v as Tab)) {
       setTab((prev) => (prev === v ? prev : (v as Tab)))
     }
   }, [location.hash])
@@ -167,6 +171,12 @@ export default function QueueDetailPage() {
     const tick = window.setInterval(() => setTask((t) => (t ? { ...t } : t)), 2000)
     return () => window.clearInterval(tick)
   }, [task?.status])
+
+  // 训练结束后评估可见性：task done 后评估作为独立 jobs 在跑（出图 + CLIP/DINO），
+  // 这里轮询出「评估中 done/total」，header 跨 tab 常驻显示。
+  const evalProgress = useTaskEvalProgress(
+    task?.project_id, task?.version_id, taskId, task?.status === 'done',
+  )
 
   if (!Number.isFinite(taskId)) return <p className="text-err">{t('queueDetail.invalidId')}</p>
 
@@ -239,6 +249,7 @@ export default function QueueDetailPage() {
     { key: 'overview', label: t('queueDetail.tabOverview') },
     { key: 'log',      label: t('queueDetail.tabLogs') },
     { key: 'monitor',  label: t('queueDetail.tabMonitor') },
+    { key: 'eval',     label: t('queueDetail.tabEval') },
     { key: 'outputs',  label: t('queueDetail.tabOutputs') },
     { key: 'snapshot', label: t('queueDetail.tabSnapshot') },
   ]
@@ -264,6 +275,12 @@ export default function QueueDetailPage() {
             <span className={STATUS_BADGE[status]}>
               {status === 'running' && <span className="dot dot-running" />}
               {STATUS_LABEL[status]}
+            </span>
+          )}
+          {evalProgress?.active && (
+            <span className="badge badge-accent" title={t('eval.evaluatingHint')}>
+              <span className="dot dot-running" />
+              {t('eval.evaluatingProgress', { done: evalProgress.done, total: evalProgress.total })}
             </span>
           )}
           <span className="flex-1" />
@@ -350,6 +367,7 @@ export default function QueueDetailPage() {
         )}
         {tab === 'log' && <LogTab taskId={taskId} />}
         {tab === 'monitor' && <MonitorTab taskId={taskId} />}
+        {tab === 'eval' && <EvalTab taskId={taskId} />}
         {tab === 'outputs' && <OutputsTab taskId={taskId} />}
         {tab === 'snapshot' && <SnapshotConfigTab task={task} />}
       </div>
@@ -514,6 +532,117 @@ function MonitorTab({ taskId }: { taskId: number }) {
   return (
     <div className="flex-1 min-h-0 overflow-hidden">
       <MonitorDashboard taskId={taskId} />
+    </div>
+  )
+}
+
+// ── EvalTab ─────────────────────────────────────────────────────────────────
+
+// 评估日志：把该 task 所有评估 job（出图 + 各指标）的原始日志按时间（job id）拼成
+// 一条流，喂给统一的 TaskLogDrawer（全 app 一致的底部抽屉）。不按 checkpoint 分。
+function useEvalLogSource(
+  pid: number | undefined,
+  vid: number | undefined,
+  taskId: number,
+): LogSource | null {
+  const [jobs, setJobs] = useState<EvalJobInfo[]>([])
+  const [buffers, setBuffers] = useState<Record<number, string>>({})
+  const buffersRef = useRef<Record<number, string>>({})
+
+  const loadJobs = useCallback(async () => {
+    if (!pid || !vid || !taskId) return
+    try {
+      // 后端只返回 run 仍存在的 job（重跑会清掉上一轮 run），所以这里拿到的天然只有
+      // 这次的 job —— 不需要前端再按状态过滤。
+      const r = await api.listTaskEvalJobs(pid, vid, taskId)
+      setJobs(r.jobs)
+    } catch {
+      // 辅助信息，拉失败不打扰
+    }
+  }, [pid, vid, taskId])
+
+  // 评估 tab 挂载期间稳定轮询：清空 + 重跑后新 job 是从无到有，靠它发现（之前只在
+  // 已有 job 活跃时轮询，清空后 job 全 canceled → 不轮询 → 重跑的新 job 看不到）。
+  useEffect(() => {
+    void loadJobs()
+    const id = window.setInterval(() => void loadJobs(), 5000)
+    return () => window.clearInterval(id)
+  }, [loadJobs])
+
+  // 每个 job 的日志 hydrate 一次
+  const jobIds = jobs.map((j) => j.id).join(',')
+  useEffect(() => {
+    let alive = true
+    for (const j of jobs) {
+      if (buffersRef.current[j.id] === undefined) {
+        buffersRef.current[j.id] = ''
+        void api.getJobLog(j.id).then((r) => {
+          if (!alive) return
+          buffersRef.current[j.id] = r.content || ''
+          setBuffers({ ...buffersRef.current })
+        }).catch(() => {})
+      }
+    }
+    return () => { alive = false }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobIds])
+
+  // 实时续流
+  useEventStream((evt) => {
+    if (
+      evt.type === 'job_log_appended'
+      && typeof evt.job_id === 'number'
+      && jobs.some((j) => j.id === evt.job_id)
+    ) {
+      const id = evt.job_id
+      const text = typeof evt.text === 'string' ? evt.text : ''
+      const prev = buffersRef.current[id] ?? ''
+      const sep = prev && !prev.endsWith('\n') ? '\n' : ''
+      buffersRef.current[id] = prev + sep + text + '\n'
+      setBuffers({ ...buffersRef.current })
+    }
+  })
+
+  return useMemo(() => {
+    if (jobs.length === 0) return null
+    const ordered = [...jobs].sort((a, b) => a.id - b.id)
+    const lines: string[] = []
+    for (const j of ordered) {
+      const buf = buffers[j.id]
+      if (!buf) continue
+      const ls = buf.split('\n')
+      if (ls.length && ls[ls.length - 1] === '') ls.pop()
+      lines.push(...ls)
+    }
+    const status: LogSourceStatus =
+      jobs.some((j) => j.status === 'running') ? 'running'
+        : jobs.some((j) => j.status === 'pending') ? 'pending'
+          : jobs.some((j) => j.status === 'failed') ? 'failed'
+            : 'done'
+    // 中断：取消该 task 全部未完成的评估 job（异步 SIGTERM）。区别于「清空」——
+    // 不删已算出的结果，只停后续 job。drawer 在 live 时把它显示成 header 右侧取消按钮。
+    const active = jobs.filter(
+      (j) => j.status !== 'done' && j.status !== 'failed' && j.status !== 'canceled',
+    )
+    const onCancel = active.length
+      ? () => {
+          active.forEach((j) => void api.cancelJob(j.id).catch(() => {}))
+          void loadJobs()
+        }
+      : undefined
+    return { key: `eval-${taskId}`, label: '评估', status, lines, onCancel }
+  }, [jobs, buffers, taskId, loadJobs])
+}
+
+function EvalTab({ taskId }: { taskId: number }) {
+  const { state, connected } = useMonitorProgress(taskId)
+  const evalLog = useEvalLogSource(state?.project_id, state?.version_id, taskId)
+  return (
+    <div className="relative flex flex-col flex-1 min-h-0">
+      <div className="flex-1 min-h-0 overflow-auto p-4">
+        <EvalMetricsPanel state={state} connected={connected} taskId={taskId} />
+      </div>
+      <TaskLogDrawer sources={[evalLog]} />
     </div>
   )
 }

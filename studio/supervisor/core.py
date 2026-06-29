@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from .. import db, secrets as _secrets
+from ..services import eval_auto, eval_validation
 from ..services.projects import jobs as project_jobs
 from ..infrastructure.log_tail import LogTailer, MonitorStatePoller
 from ..paths import (
@@ -481,7 +482,7 @@ class Supervisor:
         allow_gpu = self._allow_gpu_during_train()
         with db.connection_for(self._db_path) as conn:
             pending = project_jobs.list_jobs(conn, status="pending")
-        pending.sort(key=lambda j: j["id"])
+        pending.sort(key=project_jobs.dispatch_order)
         for job in pending:
             kind = job["kind"]
             if kind in GPU_BOUND_JOB_KINDS:
@@ -542,6 +543,10 @@ class Supervisor:
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_fp = open(log_path, "wb")
 
+            # 训练前：若 task 启用了验证集指标且设了分隔比例，从 train/ 划 held-out
+            # 到 validation/（移动，不参与训练）。失败不阻断训练，只记日志。
+            self._maybe_split_validation(task, cfg_path, log_fp)
+
             cmd = self._cmd_builder(task, cfg_path)
             # ADR 0006 PR-1：LORA_TASK_ID 注入让训练子进程把用户周期 save 写到
             # output_dir/state/task_<TID>/ 子目录，避免同 version 多 task 互覆盖。
@@ -595,6 +600,31 @@ class Supervisor:
         if explicit_cfg:
             return Path(explicit_cfg)
         return self._configs_dir / f"{task['config_name']}.yaml"
+
+    def _maybe_split_validation(
+        self, task: dict[str, Any], cfg_path: Path, log_fp: Any
+    ) -> None:
+        """训练前把 held-out 验证集从 train/ 划到 validation/（移动）。
+
+        仅当 task 启用 eval_validation 且 ratio>0 时生效；按比例补足、够了不动、
+        永不移回。失败只记日志，不阻断训练。
+        """
+        try:
+            with db.connection_for(self._db_path) as conn:
+                summary = eval_validation.split_for_task(conn, task, cfg_path)
+        except Exception:
+            logger.exception("validation split failed for task=%s", task.get("id"))
+            return
+        if summary and summary.get("moved"):
+            try:
+                log_fp.write(
+                    f"[eval-validation] moved {summary['moved']} image(s) to "
+                    f"validation/ (train={summary['train']}, "
+                    f"validation={summary['validation']})\n".encode("utf-8")
+                )
+                log_fp.flush()
+            except Exception:
+                pass
 
     def _fail_task_config_missing(
         self, task: dict[str, Any], cfg_path: Path
@@ -689,6 +719,8 @@ class Supervisor:
                     # 覆盖式单文件不会堆积，删了反而造成「resume 后到下一
                     # epoch 末之间无恢复点」的窗口。
                     self._clear_pause_fields(tid)
+                elif evt_type == "eval_training_finished":
+                    slot.eval_training_finished_payload = dict(payload)
                 self._on_event({
                     "type": evt_type,
                     "task_id": tid,
@@ -702,6 +734,36 @@ class Supervisor:
                 "seq": next(self._log_seq),
             })
         return _on_task_log
+
+    def _queue_auto_eval_after_training(
+        self, tid: int, payload: dict[str, Any]
+    ) -> None:
+        try:
+            with db.connection_for(self._db_path) as conn:
+                task = db.get_task(conn, tid)
+                if not task:
+                    return
+                queued = eval_auto.queue_training_finished_eval(conn, task, payload)
+        except Exception:
+            logger.exception("after-training auto eval enqueue failed for task=%s", tid)
+            return
+        if not queued:
+            return
+        for job, run in queued:
+            self._on_event({
+                "type": "eval_auto_sample_queued",
+                "task_id": tid,
+                "job_id": job.get("id"),
+                "project_id": job.get("project_id"),
+                "version_id": job.get("version_id"),
+                "run_id": run.get("run_id"),
+                "checkpoint": run.get("checkpoint"),
+            })
+        self._on_event({
+            "type": "eval_auto_after_training_queued",
+            "task_id": tid,
+            "count": len(queued),
+        })
 
     def _make_monitor_callback(
         self, tid: int
@@ -1216,6 +1278,11 @@ class Supervisor:
                 {"type": "task_state_changed", "task_id": cid, "status": status}
             )
             logger.info("task %d finished: %s (rc=%d)", cid, status, rc)
+            if status == "done" and slot.eval_training_finished_payload is not None:
+                self._queue_auto_eval_after_training(
+                    cid,
+                    slot.eval_training_finished_payload,
+                )
         else:  # job
             with db.connection_for(self._db_path) as conn:
                 if status == "done":
@@ -1326,7 +1393,7 @@ class Supervisor:
         Python 端映射成 SIGBREAK（sig=21），由 resume phase 注册的 handler 捕获。
         POSIX：`SIGINT` — 跟 SIGTERM 分流，cancel 走 SIGTERM 不撞。
 
-        Spike 报告 docs/design/queue-pause-spike-report.md 验证过链路通。
+        信号链路经 spike 验证（决策见 ADR 0006）。
         """
         try:
             if os.name == "nt":
