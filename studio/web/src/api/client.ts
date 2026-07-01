@@ -1486,6 +1486,10 @@ export interface Task {
   id: number
   name: string
   config_name: string
+  /** 0.17 P-D — 后端权威任务类型（_v5 migration 加，值 train/reg_ai/generate）。
+   *  老行经 `NOT NULL DEFAULT 'train'` 的 ALTER 自动 backfill；此处可选仅为兼容
+   *  未带该字段的测试 mock，运行时恒有值。 */
+  task_type?: 'train' | 'reg_ai' | 'generate'
   status: TaskStatus
   priority: number
   created_at: number
@@ -1526,6 +1530,14 @@ export interface Task {
   /** ADR 0006 Addendum 2 — is_resumable 信号：status ∈ paused/failed/canceled
    *  且恢复点文件在盘上。UI 用来决定是否显示"继续训练"按钮。 */
   is_resumable?: boolean
+}
+
+/** 0.17 P-E — /api/queue?group=history 的分页响应。 */
+export interface QueueHistoryPage {
+  items: Task[]
+  total: number
+  page: number
+  page_size: number
 }
 
 /** ADR 0006 PR-2 — GET /api/queue/hold 返回。`held=true` 时 UI 顶部
@@ -2626,6 +2638,27 @@ export const api = {
     if (opts?.includeGenerate) params.push('include_generate=true')
     const qs = params.length ? `?${params.join('&')}` : ''
     return req<{ items: Task[] }>(`/api/queue${qs}`).then((r) => r.items)
+  },
+  // 0.17 P-A/P-C —— 队列页分区数据源。live = 进行中 + 等待（running/paused/pending），
+  // 不分页；q 搜 name/config_name。
+  listQueueLive: (q?: string) => {
+    const params = new URLSearchParams({ group: 'live' })
+    if (q) params.set('q', q)
+    return req<{ items: Task[] }>(`/api/queue?${params}`).then((r) => r.items)
+  },
+  // 0.17 P-E —— history = 已结束（done/failed/canceled），后端分页。status 传终态
+  // 做子过滤，q 搜 name/config_name。返回 { items, total, page, page_size }。
+  listQueueHistory: (opts: {
+    page: number; pageSize: number; q?: string; status?: TaskStatus
+  }) => {
+    const params = new URLSearchParams({
+      group: 'history',
+      page: String(opts.page),
+      page_size: String(opts.pageSize),
+    })
+    if (opts.q) params.set('q', opts.q)
+    if (opts.status) params.set('status', opts.status)
+    return req<QueueHistoryPage>(`/api/queue?${params}`)
   },
   getTask: (id: number) => req<Task>(`/api/queue/${id}`),
   enqueue: (payload: { config_name: string; name?: string; priority?: number }) =>

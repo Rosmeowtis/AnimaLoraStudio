@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useNavigate } from 'react-router-dom'
-import { api, type QueueHoldState, type Task, type TaskStatus } from '../api/client'
+import {
+  api, type QueueHistoryPage, type QueueHoldState, type Task, type TaskStatus,
+} from '../api/client'
 import { HoldQueueModal, type HoldDecision } from '../components/HoldQueueModal'
 import { PauseConfirmModal } from '../components/PauseConfirmModal'
 import { PauseProgressModal } from '../components/PauseProgressModal'
@@ -10,7 +12,7 @@ import { useDialog } from '../components/Dialog'
 import { useToast } from '../components/Toast'
 import { useEventStream } from '../lib/useEventStream'
 import { useMonitorProgress } from '../lib/useMonitorProgress'
-import { useEvaluatingTasks } from '../lib/useEvalProgress'
+import { useEvaluatingTasks, type EvalProgress } from '../lib/useEvalProgress'
 
 async function pickJsonFile(jsonErrorMsg: string): Promise<unknown | null> {
   return new Promise((resolve, reject) => {
@@ -26,7 +28,10 @@ async function pickJsonFile(jsonErrorMsg: string): Promise<unknown | null> {
   })
 }
 
-type TaskKind = 'train' | 'tag' | 'reg' | 'download' | 'curate' | 'unknown'
+// tasks 表真实 task_type 只有这三值（train/reg_ai/generate）。0.17 P-D 前这里
+// 靠 config_name 子串猜、且掺入 tag/download/curate 等 project_jobs 的 kind（对
+// 队列列表是死分支），现收敛为后端权威字段。
+type TaskKind = 'train' | 'reg_ai' | 'generate'
 
 const STATUS_TONE: Record<TaskStatus, string> = {
   pending:   'neutral',
@@ -37,15 +42,14 @@ const STATUS_TONE: Record<TaskStatus, string> = {
   paused:    'warn',
 }
 
-function inferKind(task: Task): TaskKind {
-  const n = task.config_name.toLowerCase()
-  if (n.includes('train') || n.includes('lora')) return 'train'
-  if (n.includes('tag') || n.includes('caption') || n.includes('wd14')) return 'tag'
-  if (n.includes('reg') || n.includes('regular')) return 'reg'
-  if (n.includes('download') || n.includes('booru')) return 'download'
-  if (n.includes('curate') || n.includes('filter')) return 'curate'
-  return 'unknown'
+/** 读后端权威 task_type；老行 backfill 为 'train'，`?? 'train'` 仅作类型兜底。
+ *  导出供 Queue.test.tsx 直接测（不再受 config_name 影响是本函数的契约）。 */
+export function taskKind(task: Task): TaskKind {
+  return task.task_type ?? 'train'
 }
+
+// 0.17 P-E — 历史分页可选每页条数。
+const HISTORY_PAGE_SIZES = [20, 50, 100]
 
 function fmtAgo(ts: number): string {
   const sec = Math.max(0, Date.now() / 1000 - ts)
@@ -71,34 +75,244 @@ function fmtDurationShort(ms: number): string {
   return `${(ms / 3600e3).toFixed(1)}h`
 }
 
+/** running task 的「已运行 Xm」标签；非 running 返 null。 */
+function estimateEta(task: Task): string | null {
+  if (task.status !== 'running' || !task.started_at) return null
+  const elapsed = (Date.now() / 1000 - task.started_at) * 1000
+  return `已运行 ${fmtDurationShort(elapsed)}`
+}
+
+/** 队列行卡片。0.17 P-A 从 QueuePage 内联 map 抽出，供三个分区复用同一行渲染。
+ *  monitor 只对 running 且 id===runningTaskId 的那行有意义；evalInfo 只对 terminal
+ *  且仍在评估的行有值。 */
+function QueueTaskRow({
+  task, runningTaskId, monitor, evalInfo, isWaitingForRelease, prevAhead,
+  onOpen, onResume, onCancelPaused,
+}: {
+  task: Task
+  runningTaskId: number | null
+  monitor: { step?: number | null; total_steps?: number | null } | null
+  evalInfo?: EvalProgress
+  isWaitingForRelease: boolean
+  prevAhead: number
+  onOpen: (id: number) => void
+  onResume: (task: Task) => void | Promise<void>
+  onCancelPaused: (task: Task) => void | Promise<void>
+}) {
+  const { t } = useTranslation()
+  const STATUS_LABEL: Record<TaskStatus, string> = {
+    pending:  t('status.queued'), running: t('status.running'),
+    done:     t('status.done'),   failed:  t('status.failed'),
+    canceled: t('status.canceled'), paused: t('status.paused'),
+  }
+  const KIND_LABEL: Record<TaskKind, string> = {
+    train: t('nav.train'), reg_ai: t('nav.reg'), generate: t('nav.generate'),
+  }
+  const isRunning = task.status === 'running'
+  const isPaused = task.status === 'paused'
+  const isTerminal = ['done', 'failed', 'canceled'].includes(task.status)
+  const hasProject = !!(task.project_id && task.version_id)
+  const kind = taskKind(task)
+  const eta = estimateEta(task)
+  const tone = STATUS_TONE[task.status]
+
+  return (
+    <button
+      onClick={() => onOpen(task.id)}
+      className={`card card-hover block overflow-hidden text-left p-0 ${isRunning ? 'cursor-pointer border border-accent bg-accent-soft' : 'cursor-default border border-subtle bg-surface'}`}
+    >
+      <div
+        className="px-[22px] py-4 grid gap-4 items-center"
+        style={{ gridTemplateColumns: '60px 1fr 110px 1fr 160px' }}
+      >
+        <span className={`font-mono text-sm ${isRunning ? 'text-accent font-semibold' : 'text-fg-tertiary font-normal'}`}>
+          #{task.id}
+        </span>
+
+        <div style={{ minWidth: 0 }}>
+          <div className="font-semibold text-fg-primary text-sm overflow-hidden text-ellipsis whitespace-nowrap">
+            {task.name}
+          </div>
+          <div className="font-mono text-xs text-fg-tertiary mt-0.5 flex items-center gap-1.5">
+            <span>{KIND_LABEL[kind]}</span>
+            <span>{task.config_name}</span>
+            {hasProject && (
+              <Link
+                to={`/projects/${task.project_id}?version=${task.version_id}`}
+                onClick={(e) => e.stopPropagation()}
+                className="text-accent text-xs no-underline hover:underline shrink-0"
+              >
+                {t('queue.project')}
+              </Link>
+            )}
+          </div>
+        </div>
+
+        <span className={`badge badge-${tone} text-xs text-center`}>
+          {isRunning && <span className="dot dot-running" />}
+          {STATUS_LABEL[task.status]}
+        </span>
+
+        <div className="text-sm text-fg-secondary" style={{ minWidth: 0 }}>
+          {isRunning ? (
+            <div className="flex flex-col gap-0.5">
+              <span className="font-mono text-fg-tertiary text-xs">
+                {(() => {
+                  if (
+                    task.id === runningTaskId &&
+                    monitor?.step != null &&
+                    monitor.total_steps != null &&
+                    monitor.total_steps > 0
+                  ) {
+                    return `step ${monitor.step.toLocaleString()} / ${monitor.total_steps.toLocaleString()}`
+                  }
+                  return fmtDuration(task.started_at, null)
+                })()}
+              </span>
+              <div className="h-1 bg-overlay rounded-sm overflow-hidden">
+                {(() => {
+                  const haveSteps =
+                    task.id === runningTaskId &&
+                    monitor?.step != null &&
+                    monitor.total_steps != null &&
+                    monitor.total_steps > 0
+                  if (haveSteps) {
+                    const pct = Math.max(
+                      0,
+                      Math.min(100, (monitor!.step! / monitor!.total_steps!) * 100),
+                    )
+                    return <div className="h-full bg-accent rounded-sm" style={{ width: `${pct}%` }} />
+                  }
+                  return <div className="h-full bg-accent/40 rounded-sm animate-pulse" style={{ width: '20%' }} />
+                })()}
+              </div>
+            </div>
+          ) : task.error_msg ? (
+            <span className="text-err overflow-hidden text-ellipsis whitespace-nowrap block text-xs">
+              {task.error_msg}
+            </span>
+          ) : isPaused ? (
+            <span className="text-xs text-warn">
+              {t('queue.pausedAtStep', {
+                step: task.paused_step ?? 0,
+                time: task.paused_at ? fmtAgo(task.paused_at) : '',
+              })}
+            </span>
+          ) : isTerminal ? (
+            evalInfo?.active ? (
+              <span className="text-accent text-xs flex items-center gap-1" title={t('eval.evaluatingHint')}>
+                <span className="dot dot-running" />
+                {t('eval.evaluatingProgress', {
+                  done: evalInfo.done,
+                  total: evalInfo.total,
+                })}
+              </span>
+            ) : (
+              <span className="font-mono text-fg-tertiary text-xs">
+                {t('queue.duration', { time: fmtDuration(task.started_at, task.finished_at) })}
+              </span>
+            )
+          ) : (
+            <span className="text-fg-tertiary text-xs">—</span>
+          )}
+        </div>
+
+        <span className="font-mono text-sm text-fg-tertiary text-right">
+          {isRunning ? (
+            <>
+              {eta && <span className="text-accent">{eta}</span>}
+              {eta && <br />}
+              <span className="text-xs">{fmtAgo(task.started_at!)} 开始</span>
+            </>
+          ) : isPaused ? (
+            <span className="flex flex-col items-end gap-1">
+              <span className="flex gap-1.5">
+                <button
+                  onClick={(e) => { e.stopPropagation(); void onResume(task) }}
+                  className="btn btn-secondary btn-xs"
+                  title={t('queue.resumeHint')}
+                  data-testid={`resume-btn-${task.id}`}
+                >
+                  {t('queue.resume')}
+                </button>
+                <button
+                  onClick={(e) => { e.stopPropagation(); void onCancelPaused(task) }}
+                  className="btn btn-ghost btn-xs text-err"
+                  title={t('queue.cancelPausedHint')}
+                >
+                  {t('queue.cancelPaused')}
+                </button>
+              </span>
+              {isWaitingForRelease && (
+                <span className="text-xs text-fg-tertiary">
+                  {t('queue.waitingForRelease')}
+                </span>
+              )}
+            </span>
+          ) : task.finished_at ? (
+            <span className="flex flex-col items-end gap-1">
+              {/* ADR 0006 Addendum 2 — failed/canceled 且恢复点在盘 → 继续训练。 */}
+              {task.is_resumable && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); void onResume(task) }}
+                  className="btn btn-secondary btn-xs"
+                  title={t('queue.resumeTerminalHint')}
+                  data-testid={`resume-btn-${task.id}`}
+                >
+                  {t('queue.resumeTerminal')}
+                </button>
+              )}
+              <span>
+                <span>{fmtAgo(task.finished_at)}</span>
+                <br />
+                <span className="text-xs text-fg-tertiary">{t('status.done')}</span>
+              </span>
+            </span>
+          ) : (
+            <span className="flex flex-col items-end gap-0.5">
+              <span>{t('queue.ahead', { n: prevAhead })}</span>
+              {isWaitingForRelease && (
+                <span className="text-xs text-warn">
+                  {t('queue.waitingForRelease')}
+                </span>
+              )}
+            </span>
+          )}
+        </span>
+      </div>
+    </button>
+  )
+}
+
 export default function QueuePage() {
   const { t } = useTranslation()
-  const [tasks, setTasks] = useState<Task[]>([])
+  // 0.17 P-A/P-E — 队列拆两条数据源：live（进行中+等待，不分页）、history（已结束，
+  // 后端分页）。搜索 + 历史子过滤走后端，保证分页 total 与结果一致。
+  const [live, setLive] = useState<Task[]>([])
+  const [history, setHistory] = useState<QueueHistoryPage>({
+    items: [], total: 0, page: 1, page_size: HISTORY_PAGE_SIZES[0],
+  })
   const [loaded, setLoaded] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [exporting, setExporting] = useState(false)
+  // 搜索（防抖后进后端）+ 历史分页 / 终态子过滤
+  const [search, setSearch] = useState('')
+  const [searchDebounced, setSearchDebounced] = useState('')
+  const [historyStatus, setHistoryStatus] = useState<TaskStatus | null>(null)
+  const [historyPage, setHistoryPage] = useState(1)
+  const [historyPageSize, setHistoryPageSize] = useState(HISTORY_PAGE_SIZES[0])
+  // 过滤行折叠（与项目页一致：默认收起，header 漏斗按钮开关，收起且有筛选时带小圆点）。
+  const [filtersOpen, setFiltersOpen] = useState(false)
   const reloadTimer = useRef<number | null>(null)
   const { toast } = useToast()
   const { confirm } = useDialog()
   const navigate = useNavigate()
 
-  const STATUS_LABEL: Record<TaskStatus, string> = {
-    pending:   t('status.queued'),
-    running:   t('status.running'),
-    done:      t('status.done'),
-    failed:    t('status.failed'),
-    canceled:  t('status.canceled'),
-    paused:    t('status.paused'),
-  }
-
   // ADR 0006：队列挂起状态，banner + holdModal 用。
   const [holdState, setHoldState] = useState<QueueHoldState | null>(null)
   const [holdModalOpen, setHoldModalOpen] = useState(false)
   const [pausingTaskId, setPausingTaskId] = useState<number | null>(null)
-  // ADR 0006 Addendum 1 §UI：确认 modal 先于 PauseProgressModal，告知"暂停可能影响
-  // 实验性参数 / 丢失当前轮进度"。pauseConfirmTaskId 非 null 时显示 PauseConfirmModal；
-  // 用户点确认 → 调 api + setPausingTaskId 进 PauseProgressModal；用户取消 → 清空。
   const [pauseConfirmTaskId, setPauseConfirmTaskId] = useState<number | null>(null)
 
   const reloadHold = useCallback(async () => {
@@ -106,27 +320,49 @@ export default function QueuePage() {
       const s = await api.getQueueHold()
       setHoldState(s)
     } catch {
-      // 网络错 / 启动期 supervisor 未就绪 → 静默；下一轮 SSE 触发重试。
       setHoldState(null)
     }
   }, [])
 
-  const KIND_LABEL: Record<TaskKind, string> = {
-    train: t('nav.train'), tag: t('nav.tag'), reg: t('nav.reg'),
-    download: t('nav.download'), curate: t('nav.curate'), unknown: t('monitor.taskLabel'),
-  }
-  const reload = useCallback(async () => {
-    try { setTasks(await api.listQueue()); setError(null) }
+  const reloadLive = useCallback(async () => {
+    try { setLive(await api.listQueueLive(searchDebounced || undefined)); setError(null) }
     catch (e) { setError(String(e)) }
-    finally { setLoaded(true) }
-  }, [])
+  }, [searchDebounced])
+
+  const reloadHistory = useCallback(async () => {
+    try {
+      const r = await api.listQueueHistory({
+        page: historyPage, pageSize: historyPageSize,
+        q: searchDebounced || undefined, status: historyStatus ?? undefined,
+      })
+      setHistory(r); setError(null)
+    } catch (e) { setError(String(e)) }
+  }, [historyPage, historyPageSize, searchDebounced, historyStatus])
+
+  const reload = useCallback(async () => {
+    await Promise.all([reloadLive(), reloadHistory()])
+  }, [reloadLive, reloadHistory])
+
+  // SSE 处理器可能被 useEventStream 捕获一次；用 ref 取最新 reload 避免 stale 闭包
+  // （reloadLive/reloadHistory 随过滤条件变 identity）。
+  const reloadLiveRef = useRef(reloadLive); reloadLiveRef.current = reloadLive
+  const reloadHistoryRef = useRef(reloadHistory); reloadHistoryRef.current = reloadHistory
+
+  // 搜索防抖 300ms → 进后端；改搜索词回到第 1 页。
+  useEffect(() => {
+    const id = window.setTimeout(() => {
+      setSearchDebounced(search); setHistoryPage(1)
+    }, 300)
+    return () => window.clearTimeout(id)
+  }, [search])
+
+  useEffect(() => { void reloadLive() }, [reloadLive])
+  useEffect(() => {
+    void (async () => { await reloadHistory(); setLoaded(true) })()
+  }, [reloadHistory])
 
   useEventStream(
     (evt) => {
-      // ADR 0006 PR-4 — train_loop_started / auto_epoch_backup_written 都不改
-      // task.status 但要让 UI 看到 is_pausable=true（解锁暂停按钮）：is_task_pausable
-      // 要 train_loop_started + 首个 epoch backup 落盘二者都满足，真正翻 true 的
-      // 是后者，所以两个事件都得 reload；queue_hold_changed 要刷 banner。
       if (
         evt.type === 'task_state_changed' ||
         evt.type === 'train_loop_started' ||
@@ -138,11 +374,11 @@ export default function QueuePage() {
         }
         if (reloadTimer.current) return
         reloadTimer.current = window.setTimeout(() => {
-          reloadTimer.current = null; void reload()
+          reloadTimer.current = null
+          // task 状态变化可能把 task 移进 history（terminal）或移出 live，两边都刷。
+          void reloadLiveRef.current(); void reloadHistoryRef.current()
         }, 100)
       } else if (evt.type === 'queue_export_ready' || evt.type === 'queue_export_failed') {
-        // <a> 直链发完后端 publish 这对事件,这里清 app-side "导出中..." 状态 +
-        // 失败弹 toast。和 train.zip / outputs.zip 一套范式。
         setExporting(false)
         if (evt.type === 'queue_export_failed') {
           const err = typeof evt.error === 'string' ? evt.error : '?'
@@ -150,7 +386,7 @@ export default function QueuePage() {
         }
       }
     },
-    { onOpen: () => { void reload(); void reloadHold() } },
+    { onOpen: () => { void reloadLiveRef.current(); void reloadHistoryRef.current(); void reloadHold() } },
   )
 
   // 兜底：SSE 事件丢失时 60s 强制清 exporting 状态。
@@ -160,54 +396,50 @@ export default function QueuePage() {
     return () => window.clearTimeout(tid)
   }, [exporting])
 
-  useEffect(() => { void reload(); void reloadHold() }, [reload, reloadHold])
-  // 2s 时钟 tick：仅触发 re-render 让「23m ago」「elapsed 40m」之类的相对时间
-  // 字段更新；不发任何 API。spread tasks 触发组件 re-render，下游 derived 状态
-  // 跟着更新。
-  useEffect(() => {
-    const hasRunning = tasks.some((t) => t.status === 'running')
-    if (!hasRunning) return
-    const tick = window.setInterval(() => setTasks((ts) => [...ts]), 2000)
-    return () => window.clearInterval(tick)
-  }, [tasks])
+  useEffect(() => { void reloadHold() }, [reloadHold])
 
-  // 当前 running 任务的 id，给 monitor 进度条 / 状态卡片用。
+  // running 任务的 id，给 monitor 进度条 / 顶部按钮用。
   const runningTask = useMemo(
-    () => tasks.find((t) => t.status === 'running') ?? null,
-    [tasks],
+    () => live.find((t) => t.status === 'running') ?? null,
+    [live],
   )
   const runningTaskId = runningTask?.id ?? null
-  // 训练结束后评估可见性：done task 仍在后台跑评估时显示「评估中 done/total」
-  const evalMap = useEvaluatingTasks(tasks)
-  // monitor 进度走 useMonitorProgress hook (PR #37 增量协议)：runningTaskId
-  // 切换时 hook 自动清状态 + 重拉 /api/state 冷启动；不需要本组件再写清理逻辑。
+  const hasRunning = runningTask !== null
+
+  // 2s 时钟 tick：仅触发 re-render 让「已运行 40m」之类相对时间更新；不发 API。
+  useEffect(() => {
+    if (!hasRunning) return
+    const tick = window.setInterval(() => setLive((ls) => [...ls]), 2000)
+    return () => window.clearInterval(tick)
+  }, [hasRunning])
+
+  // 评估中可见性：live 里的 done（罕见）+ history 当前页的 done 都纳入探测。
+  const evalSource = useMemo(() => [...live, ...history.items], [live, history])
+  const evalMap = useEvaluatingTasks(evalSource)
   const { state: monitor } = useMonitorProgress(runningTaskId)
 
-  const sorted = useMemo(() => [...tasks].sort((a, b) => b.id - a.id), [tasks])
+  // live 按 id 倒序拆两段：进行中（running/paused）、等待（pending）。
+  const liveSorted = useMemo(() => [...live].sort((a, b) => b.id - a.id), [live])
+  const activeItems = useMemo(
+    () => liveSorted.filter((t) => t.status === 'running' || t.status === 'paused'),
+    [liveSorted],
+  )
+  const pendingItems = useMemo(
+    () => liveSorted.filter((t) => t.status === 'pending'),
+    [liveSorted],
+  )
 
   const prevCount = useCallback((taskId: number): number => {
     let count = 0
-    for (const t of sorted) {
+    for (const t of liveSorted) {
       if (t.id === taskId) break
       if (t.status === 'running' || t.status === 'pending') count++
     }
     return count
-  }, [sorted])
+  }, [liveSorted])
 
-  const estimateEta = useCallback((task: Task): string | null => {
-    if (task.status !== 'running' || !task.started_at) return null
-    const elapsed = (Date.now() / 1000 - task.started_at) * 1000
-    return `已运行 ${fmtDurationShort(elapsed)}`
-  }, [])
+  const totalPages = Math.max(1, Math.ceil(history.total / historyPageSize))
 
-  // 用 runningTask 派生比 tasks.some 再扫一遍便宜（runningTask 已经 memo 过）
-  const hasRunning = runningTask !== null
-
-  // ADR 0006 + Addendum 1 — "真暂停" 已在 PR-2/3 上线，Addendum 1 翻盘后 Pause = Cancel
-  // + 立即释放 GPU，恢复点是最近 epoch 末 auto_epoch_state.pt。
-  // 暂停按钮只在 task.is_pausable=true 时出现（train_loop 进入后 + 首个 epoch backup
-  // 完成）；点按钮 → 先弹 PauseConfirmModal 告知用户语义 → 确认才调 api → 进
-  // PauseProgressModal 锁屏全程引导。
   const requestPause = (task: Task) => {
     setPauseConfirmTaskId(task.id)
   }
@@ -224,7 +456,7 @@ export default function QueuePage() {
       setPausingTaskId(null)
     }
   }
-  // hold-and-pause 走的快速路径（HoldQueueModal 内已 confirmed，跳过 PauseConfirmModal）
+  // hold-and-pause 快速路径（HoldQueueModal 内已 confirmed）
   const pauseTask = async (task: Task) => {
     setPausingTaskId(task.id)
     try {
@@ -313,6 +545,27 @@ export default function QueuePage() {
     }
   }
 
+  const isEmpty =
+    live.length === 0 && history.total === 0 && !searchDebounced && !historyStatus
+
+  const renderRow = (task: Task) => (
+    <QueueTaskRow
+      key={task.id}
+      task={task}
+      runningTaskId={runningTaskId}
+      monitor={monitor}
+      evalInfo={evalMap.get(task.id)}
+      isWaitingForRelease={task.status === 'pending' && holdState?.held === true}
+      prevAhead={prevCount(task.id)}
+      onOpen={(id) => navigate(`/queue/${id}`)}
+      onResume={resumeTask}
+      onCancelPaused={cancelPaused}
+    />
+  )
+
+  // 收起过滤行时用来在漏斗按钮上点小圆点。
+  const filtering = search.trim() !== '' || historyStatus !== null
+
   return (
     <StepShell
       idx={-1}
@@ -320,8 +573,22 @@ export default function QueuePage() {
       subtitle={t('queue.description')}
       actions={
         <>
-          {/* ADR 0006: 顶部 pause 按钮 — 仅 is_pausable=true 时显示（§8.1）。
-              isPausable 来自 server enrich 的 task 字段（supervisor slot.train_loop_started 派生）。 */}
+          {/* 过滤漏斗：折叠态不占行，开关过滤行；有筛选生效且收起时带小圆点（与项目页一致）。 */}
+          <button
+            className={`btn btn-sm ${filtersOpen ? 'btn-secondary' : 'btn-ghost'}`}
+            onClick={() => setFiltersOpen((o) => !o)}
+            aria-expanded={filtersOpen}
+            aria-label={t('queue.filters')}
+            title={t('queue.filters')}
+            data-testid="queue-filter-toggle"
+          >
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M3 4h18l-7 8v6l-4 2v-8L3 4z" />
+            </svg>
+            {!filtersOpen && filtering && (
+              <span className="dot dot-running" aria-label={t('queue.filtersActive')} />
+            )}
+          </button>
           {runningTask?.is_pausable && (
             <button
               onClick={() => requestPause(runningTask)}
@@ -364,13 +631,10 @@ export default function QueuePage() {
             </button>
           )}
           <button
-            disabled={busy || exporting || tasks.length === 0}
+            disabled={busy || exporting || (live.length === 0 && history.total === 0)}
             onClick={() => {
               if (exporting) return
               setExporting(true)
-              // <a download> 直链 —— 浏览器原生接管下载。文件名以后端响应头
-              // Content-Disposition.filename 为准（带服务端时间戳）,download
-              // 属性是兜底。app-side "导出中..." 由 queue_export_ready/_failed SSE 清。
               const a = document.createElement('a')
               a.href = api.queueExportUrl()
               a.download = `queue_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.json`
@@ -401,6 +665,42 @@ export default function QueuePage() {
           <button onClick={() => void reload()} className="btn btn-ghost btn-sm">{t('common.refresh')}</button>
         </>
       }
+      belowHeader={filtersOpen && (
+        // 0.17 P-C 过滤行 —— 与项目页 FilterBar 一致：header 下全宽条，搜索 60% +
+        // 状态 select。搜索防抖下沉后端搜 name/config；状态 select 是历史段终态子过滤。
+        <div
+          className="px-6 py-2 border-b border-subtle flex items-center gap-3"
+          data-testid="queue-filterbar"
+        >
+          <input
+            className="input"
+            style={{ width: '60%' }}
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder={t('queue.searchPlaceholder')}
+            aria-label={t('common.search')}
+            data-testid="queue-search"
+          />
+          <span className="flex-1" />
+          <select
+            className="input"
+            style={{ width: '10%', minWidth: 120 }}
+            value={historyStatus ?? 'all'}
+            onChange={(e) => {
+              const v = e.target.value
+              setHistoryStatus(v === 'all' ? null : (v as TaskStatus))
+              setHistoryPage(1)
+            }}
+            aria-label={t('common.status')}
+            data-testid="history-status-filter"
+          >
+            <option value="all">{t('queue.filterAll')}</option>
+            <option value="done">{t('status.done')}</option>
+            <option value="failed">{t('status.failed')}</option>
+            <option value="canceled">{t('status.canceled')}</option>
+          </select>
+        </div>
+      )}
     >
       <div className="flex flex-col gap-2.5 flex-1 min-h-0 overflow-y-auto">
         {/* ADR §4.1 队列挂起 banner — 仅 held=true 时显示，sticky 顶部。 */}
@@ -443,7 +743,7 @@ export default function QueuePage() {
               </div>
             ))}
           </div>
-        ) : tasks.length === 0 ? (
+        ) : isEmpty ? (
           <div className="rounded-lg border border-subtle bg-surface py-12 text-center">
             <div className="text-md font-semibold text-fg-secondary mb-1.5">
               {t('queue.empty')}
@@ -453,186 +753,79 @@ export default function QueuePage() {
             </div>
           </div>
         ) : (
-          <div className="flex flex-col gap-2">
-            {sorted.map((task) => {
-              const isRunning = task.status === 'running'
-              const isPaused = task.status === 'paused'
-              const isTerminal = ['done', 'failed', 'canceled'].includes(task.status)
-              const hasProject = !!(task.project_id && task.version_id)
-              const isWaitingForRelease = task.status === 'pending' && holdState?.held === true
-              const kind = inferKind(task)
-              const eta = estimateEta(task)
-              const tone = STATUS_TONE[task.status]
+          <div className="flex flex-col gap-4">
+            {/* 进行中（running + paused） */}
+            {activeItems.length > 0 && (
+              <section className="flex flex-col gap-2">
+                <h3 className="text-xs font-semibold text-fg-tertiary uppercase tracking-wide">
+                  {t('queue.sectionActive')} ({activeItems.length})
+                </h3>
+                {activeItems.map(renderRow)}
+              </section>
+            )}
 
-              return (
-                <button
-                  key={task.id}
-                  onClick={() => navigate(`/queue/${task.id}`)}
-                  className={`card card-hover block overflow-hidden text-left p-0 ${isRunning ? 'cursor-pointer border border-accent bg-accent-soft' : 'cursor-default border border-subtle bg-surface'}`}
-                >
-                  <div
-                    className="px-[22px] py-4 grid gap-4 items-center"
-                    style={{ gridTemplateColumns: '60px 1fr 110px 1fr 160px' }}
-                  >
-                    <span className={`font-mono text-sm ${isRunning ? 'text-accent font-semibold' : 'text-fg-tertiary font-normal'}`}>
-                      #{task.id}
-                    </span>
+            {/* 等待入队（pending） */}
+            {pendingItems.length > 0 && (
+              <section className="flex flex-col gap-2">
+                <h3 className="text-xs font-semibold text-fg-tertiary uppercase tracking-wide">
+                  {t('queue.sectionWaiting')} ({pendingItems.length})
+                </h3>
+                {pendingItems.map(renderRow)}
+              </section>
+            )}
 
-                    <div style={{ minWidth: 0 }}>
-                      <div className="font-semibold text-fg-primary text-sm overflow-hidden text-ellipsis whitespace-nowrap">
-                        {task.name}
-                      </div>
-                      <div className="font-mono text-xs text-fg-tertiary mt-0.5 flex items-center gap-1.5">
-                        <span>{KIND_LABEL[kind]}</span>
-                        <span>{task.config_name}</span>
-                        {hasProject && (
-                          <Link
-                            to={`/projects/${task.project_id}?version=${task.version_id}`}
-                            onClick={(e) => e.stopPropagation()}
-                            className="text-accent text-xs no-underline hover:underline shrink-0"
-                          >
-                            {t('queue.project')}
-                          </Link>
-                        )}
-                      </div>
-                    </div>
+            {/* 历史（terminal，后端分页） */}
+            <section className="flex flex-col gap-2">
+              <h3 className="text-xs font-semibold text-fg-tertiary uppercase tracking-wide">
+                {t('queue.sectionHistory')} ({history.total})
+              </h3>
 
-                    <span className={`badge badge-${tone} text-xs text-center`}>
-                      {isRunning && <span className="dot dot-running" />}
-                      {STATUS_LABEL[task.status]}
-                    </span>
+              {history.items.length === 0 ? (
+                <div className="rounded-lg border border-subtle bg-surface py-8 text-center text-sm text-fg-tertiary">
+                  {t('queue.noMatch')}
+                </div>
+              ) : (
+                history.items.map(renderRow)
+              )}
 
-                    <div className="text-sm text-fg-secondary" style={{ minWidth: 0 }}>
-                      {isRunning ? (
-                        <div className="flex flex-col gap-0.5">
-                          <span className="font-mono text-fg-tertiary text-xs">
-                            {(() => {
-                              if (
-                                task.id === runningTaskId &&
-                                monitor?.step != null &&
-                                monitor.total_steps != null &&
-                                monitor.total_steps > 0
-                              ) {
-                                return `step ${monitor.step.toLocaleString()} / ${monitor.total_steps.toLocaleString()}`
-                              }
-                              return fmtDuration(task.started_at, null)
-                            })()}
-                          </span>
-                          <div className="h-1 bg-overlay rounded-sm overflow-hidden">
-                            {(() => {
-                              const haveSteps =
-                                task.id === runningTaskId &&
-                                monitor?.step != null &&
-                                monitor.total_steps != null &&
-                                monitor.total_steps > 0
-                              if (haveSteps) {
-                                const pct = Math.max(
-                                  0,
-                                  Math.min(100, (monitor!.step! / monitor!.total_steps!) * 100),
-                                )
-                                return <div className="h-full bg-accent rounded-sm" style={{ width: `${pct}%` }} />
-                              }
-                              return <div className="h-full bg-accent/40 rounded-sm animate-pulse" style={{ width: '20%' }} />
-                            })()}
-                          </div>
-                        </div>
-                      ) : task.error_msg ? (
-                        <span className="text-err overflow-hidden text-ellipsis whitespace-nowrap block text-xs">
-                          {task.error_msg}
-                        </span>
-                      ) : isPaused ? (
-                        <span className="text-xs text-warn">
-                          {t('queue.pausedAtStep', {
-                            step: task.paused_step ?? 0,
-                            time: task.paused_at ? fmtAgo(task.paused_at) : '',
-                          })}
-                        </span>
-                      ) : isTerminal ? (
-                        evalMap.get(task.id)?.active ? (
-                          <span className="text-accent text-xs flex items-center gap-1" title={t('eval.evaluatingHint')}>
-                            <span className="dot dot-running" />
-                            {t('eval.evaluatingProgress', {
-                              done: evalMap.get(task.id)!.done,
-                              total: evalMap.get(task.id)!.total,
-                            })}
-                          </span>
-                        ) : (
-                          <span className="font-mono text-fg-tertiary text-xs">
-                            {t('queue.duration', { time: fmtDuration(task.started_at, task.finished_at) })}
-                          </span>
-                        )
-                      ) : (
-                        <span className="text-fg-tertiary text-xs">—</span>
-                      )}
-                    </div>
-
-                    <span className="font-mono text-sm text-fg-tertiary text-right">
-                      {isRunning ? (
-                        <>
-                          {eta && <span className="text-accent">{eta}</span>}
-                          {eta && <br />}
-                          <span className="text-xs">{fmtAgo(task.started_at!)} 开始</span>
-                        </>
-                      ) : isPaused ? (
-                        <span className="flex flex-col items-end gap-1">
-                          <span className="flex gap-1.5">
-                            <button
-                              onClick={(e) => { e.stopPropagation(); void resumeTask(task) }}
-                              className="btn btn-secondary btn-xs"
-                              title={t('queue.resumeHint')}
-                              data-testid={`resume-btn-${task.id}`}
-                            >
-                              {t('queue.resume')}
-                            </button>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); void cancelPaused(task) }}
-                              className="btn btn-ghost btn-xs text-err"
-                              title={t('queue.cancelPausedHint')}
-                            >
-                              {t('queue.cancelPaused')}
-                            </button>
-                          </span>
-                          {isWaitingForRelease && (
-                            <span className="text-xs text-fg-tertiary">
-                              {t('queue.waitingForRelease')}
-                            </span>
-                          )}
-                        </span>
-                      ) : task.finished_at ? (
-                        <span className="flex flex-col items-end gap-1">
-                          {/* ADR 0006 Addendum 2 — failed/canceled 且恢复点在盘 → 继续训练。
-                              paused 走上面的分支，到这里 is_resumable=true 只剩 terminal。 */}
-                          {task.is_resumable && (
-                            <button
-                              onClick={(e) => { e.stopPropagation(); void resumeTask(task) }}
-                              className="btn btn-secondary btn-xs"
-                              title={t('queue.resumeTerminalHint')}
-                              data-testid={`resume-btn-${task.id}`}
-                            >
-                              {t('queue.resumeTerminal')}
-                            </button>
-                          )}
-                          <span>
-                            <span>{fmtAgo(task.finished_at)}</span>
-                            <br />
-                            <span className="text-xs text-fg-tertiary">{t('status.done')}</span>
-                          </span>
-                        </span>
-                      ) : (
-                        <span className="flex flex-col items-end gap-0.5">
-                          <span>{t('queue.ahead', { n: prevCount(task.id) })}</span>
-                          {isWaitingForRelease && (
-                            <span className="text-xs text-warn">
-                              {t('queue.waitingForRelease')}
-                            </span>
-                          )}
-                        </span>
-                      )}
-                    </span>
+              {/* 分页 */}
+              {history.total > historyPageSize && (
+                <div className="flex items-center justify-between flex-wrap gap-2 pt-1">
+                  <div className="flex items-center gap-2 text-xs text-fg-tertiary">
+                    <span>{t('queue.pageIndicator', { page: history.page, pages: totalPages })}</span>
+                    <select
+                      value={historyPageSize}
+                      onChange={(e) => { setHistoryPageSize(Number(e.target.value)); setHistoryPage(1) }}
+                      className="input"
+                      style={{ width: 'auto' }}
+                      data-testid="history-page-size"
+                    >
+                      {HISTORY_PAGE_SIZES.map((n) => (
+                        <option key={n} value={n}>{t('queue.perPage', { n })}</option>
+                      ))}
+                    </select>
                   </div>
-                </button>
-              )
-            })}
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      onClick={() => setHistoryPage((p) => Math.max(1, p - 1))}
+                      disabled={history.page <= 1}
+                      className="btn btn-ghost btn-sm"
+                      data-testid="history-prev"
+                    >
+                      {t('queue.prevPage')}
+                    </button>
+                    <button
+                      onClick={() => setHistoryPage((p) => Math.min(totalPages, p + 1))}
+                      disabled={history.page >= totalPages}
+                      className="btn btn-ghost btn-sm"
+                      data-testid="history-next"
+                    >
+                      {t('queue.nextPage')}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </section>
           </div>
         )}
       </div>
@@ -645,12 +838,11 @@ export default function QueuePage() {
         />
       )}
 
-      {/* ADR §4.3 暂停过程 modal — pausingTaskId 非 null 时全程锁屏。
-          modal 自己监听 pause_state / task_state_changed 切换 phase。 */}
+      {/* ADR §4.3 暂停过程 modal — pausingTaskId 非 null 时全程锁屏。 */}
       {pausingTaskId !== null && (
         <PauseProgressModal
           taskId={pausingTaskId}
-          taskName={tasks.find((t) => t.id === pausingTaskId)?.name}
+          taskName={[...live, ...history.items].find((t) => t.id === pausingTaskId)?.name}
           onClose={() => setPausingTaskId(null)}
         />
       )}
