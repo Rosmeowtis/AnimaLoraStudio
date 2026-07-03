@@ -41,6 +41,7 @@ const STATUS_TONE: Record<TaskStatus, string> = {
   failed:    'err',
   canceled:  'neutral',
   paused:    'warn',
+  scheduled: 'neutral',
 }
 
 /** 读后端权威 task_type；老行 backfill 为 'train'，`?? 'train'` 仅作类型兜底。
@@ -60,6 +61,25 @@ function fmtAgo(ts: number): string {
   if (sec < 3600) return `${Math.floor(sec / 60)}m 前`
   if (sec < 86400) return `${Math.floor(sec / 3600)}h 前`
   return `${Math.floor(sec / 86400)}d 前`
+}
+
+/** scheduled task 的计划时间：绝对（本地时区）+「约 X 后」相对提示。 */
+function fmtScheduledAbs(ts: number): string {
+  return new Date(ts * 1000).toLocaleString('zh-CN', {
+    hour12: false, month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  })
+}
+
+function fmtUntil(ts: number): string {
+  const sec = ts - Date.now() / 1000
+  if (sec <= 0) return '即将开始'
+  if (sec < 60) return '1m 内'
+  if (sec < 3600) return `${Math.ceil(sec / 60)}m 后`
+  if (sec < 86400) {
+    const h = Math.floor(sec / 3600); const m = Math.round((sec % 3600) / 60)
+    return m ? `${h}h ${m}m 后` : `${h}h 后`
+  }
+  return `${Math.ceil(sec / 86400)}d 后`
 }
 
 function fmtDuration(start: number | null, end: number | null): string {
@@ -90,7 +110,7 @@ function estimateEta(task: Task): string | null {
  *  且仍在评估的行有值。 */
 function QueueTaskRow({
   task, runningTaskId, monitor, evalInfo, isWaitingForRelease, prevAhead,
-  onOpen, onResume, onCancelPaused,
+  onOpen, onResume, onCancelPaused, onStartNow, onCancelScheduled,
 }: {
   task: Task
   runningTaskId: number | null
@@ -101,6 +121,8 @@ function QueueTaskRow({
   onOpen: (id: number) => void
   onResume: (task: Task) => void | Promise<void>
   onCancelPaused: (task: Task) => void | Promise<void>
+  onStartNow: (task: Task) => void | Promise<void>
+  onCancelScheduled: (task: Task) => void | Promise<void>
 }) {
   const { t } = useTranslation()
   const navigate = useNavigate()
@@ -108,12 +130,14 @@ function QueueTaskRow({
     pending:  t('status.queued'), running: t('status.running'),
     done:     t('status.done'),   failed:  t('status.failed'),
     canceled: t('status.canceled'), paused: t('status.paused'),
+    scheduled: t('status.scheduled'),
   }
   const KIND_LABEL: Record<TaskKind, string> = {
     train: t('queue.typeTrain'), reg_ai: t('queue.typeReg'), generate: t('queue.typeGenerate'),
   }
   const isRunning = task.status === 'running'
   const isPaused = task.status === 'paused'
+  const isScheduled = task.status === 'scheduled'
   const isTerminal = ['done', 'failed', 'canceled'].includes(task.status)
   const hasProject = !!(task.project_id && task.version_id)
   const kind = taskKind(task)
@@ -134,11 +158,12 @@ function QueueTaskRow({
   return (
     <button
       onClick={() => onOpen(task.id)}
-      className={`card card-hover block overflow-hidden text-left p-0 ${isRunning ? 'cursor-pointer border border-accent bg-accent-soft' : 'cursor-default border border-subtle bg-surface'}`}
+      title={t('queue.taskDetailTooltip')}
+      className={`card card-hover block overflow-hidden text-left p-0 cursor-pointer ${isRunning ? 'border border-accent bg-accent-soft' : 'border border-subtle bg-surface'}`}
     >
       <div
         className="px-[22px] py-4 grid gap-3 items-center"
-        style={{ gridTemplateColumns: '48px minmax(0,1fr) 88px 96px 150px 128px 104px' }}
+        style={{ gridTemplateColumns: '48px minmax(0,1fr) 88px 96px 150px 128px 176px' }}
       >
         <span className={`font-mono text-sm ${isRunning ? 'text-accent font-semibold' : 'text-fg-tertiary font-normal'}`}>
           #{task.id}
@@ -262,6 +287,20 @@ function QueueTaskRow({
                 </span>
               )}
             </span>
+          ) : isScheduled ? (
+            /* 0.17 P-B — 计划任务：计划时间 + 倒计时（操作在右侧 action 列） */
+            <span className="flex flex-col items-end gap-0.5">
+              {task.scheduled_at ? (
+                <>
+                  <span>{fmtScheduledAbs(task.scheduled_at)}</span>
+                  <span className="text-xs text-fg-tertiary font-normal">
+                    {fmtUntil(task.scheduled_at)}
+                  </span>
+                </>
+              ) : (
+                <span>—</span>
+              )}
+            </span>
           ) : task.finished_at ? (
             <span className="flex flex-col items-end gap-1">
               {/* ADR 0006 Addendum 2 — failed/canceled 且恢复点在盘 → 继续训练。 */}
@@ -293,15 +332,46 @@ function QueueTaskRow({
           )}
         </span>
 
-        {/* 0.17 跳转列：按类型跳原生页（配置页 / 正则集 / 出图结果） */}
-        <div className="text-right">
+        {/* 0.17 action 列：跳转 + scheduled 的立即开始/取消计划，全 icon 化
+            （hover title 显示文字）。 */}
+        <div className="flex items-center justify-end gap-1.5">
+          {isScheduled && (
+            <>
+              <button
+                onClick={(e) => { e.stopPropagation(); void onStartNow(task) }}
+                className="btn btn-ghost btn-sm px-2"
+                title={t('queue.startNow')}
+                aria-label={t('queue.startNow')}
+                data-testid={`startnow-btn-${task.id}`}
+              >
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor">
+                  <path d="M8 5v14l11-7z" />
+                </svg>
+              </button>
+              <button
+                onClick={(e) => { e.stopPropagation(); void onCancelScheduled(task) }}
+                className="btn btn-ghost btn-sm px-2 text-err"
+                title={t('queue.cancelScheduled')}
+                aria-label={t('queue.cancelScheduled')}
+                data-testid={`cancel-scheduled-btn-${task.id}`}
+              >
+                <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+                  <path d="M18 6L6 18M6 6l12 12" />
+                </svg>
+              </button>
+            </>
+          )}
           {jump && (
             <button
               onClick={(e) => { e.stopPropagation(); navigate(jump.path) }}
-              className="btn btn-ghost btn-sm whitespace-nowrap"
+              className="btn btn-ghost btn-sm px-2"
+              title={jump.label}
+              aria-label={jump.label}
               data-testid={`jump-btn-${task.id}`}
             >
-              {jump.label} →
+              <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M7 17L17 7M7 7h10v10" />
+              </svg>
             </button>
           )}
         </div>
@@ -442,12 +512,14 @@ export default function QueuePage() {
   const runningTaskId = runningTask?.id ?? null
   const hasRunning = runningTask !== null
 
-  // 2s 时钟 tick：仅触发 re-render 让「已运行 40m」之类相对时间更新；不发 API。
+  // 2s 时钟 tick：仅触发 re-render 让「已运行 40m」「3h 后」之类相对时间更新；
+  // 不发 API。scheduled 的倒计时也靠它。
+  const hasScheduled = useMemo(() => live.some((t) => t.status === 'scheduled'), [live])
   useEffect(() => {
-    if (!hasRunning) return
+    if (!hasRunning && !hasScheduled) return
     const tick = window.setInterval(() => setLive((ls) => [...ls]), 2000)
     return () => window.clearInterval(tick)
-  }, [hasRunning])
+  }, [hasRunning, hasScheduled])
 
   // 评估中可见性：live 里的 done（罕见）+ history 当前页的 done 都纳入探测。
   const evalSource = useMemo(() => [...live, ...history.items], [live, history])
@@ -462,6 +534,13 @@ export default function QueuePage() {
   )
   const pendingItems = useMemo(
     () => liveSorted.filter((t) => t.status === 'pending'),
+    [liveSorted],
+  )
+  // 0.17 P-B — 计划任务段：按计划时间升序（最先开始的在前），无时间的殿后。
+  const scheduledItems = useMemo(
+    () => liveSorted
+      .filter((t) => t.status === 'scheduled')
+      .sort((a, b) => (a.scheduled_at ?? Infinity) - (b.scheduled_at ?? Infinity)),
     [liveSorted],
   )
 
@@ -516,6 +595,37 @@ export default function QueuePage() {
       } else {
         toast(t('queue.resumeFailed', { reason: msg }), 'error')
       }
+    }
+  }
+
+  // 0.17 P-B — scheduled task 手动提前：立即转 pending 参与排队。
+  const startNow = async (task: Task) => {
+    const ok = await confirm(
+      t('queue.startNowConfirm', { id: task.id }),
+      { okText: t('queue.startNow') },
+    )
+    if (!ok) return
+    try {
+      await api.startTaskNow(task.id)
+      toast(t('queue.startNowSent', { id: task.id }), 'success')
+      await reload()
+    } catch (e) {
+      toast(String(e), 'error')
+    }
+  }
+
+  const cancelScheduled = async (task: Task) => {
+    const ok = await confirm(
+      t('queue.cancelScheduledConfirm', { id: task.id }),
+      { tone: 'warn', okText: t('queue.cancelScheduled') },
+    )
+    if (!ok) return
+    try {
+      await api.cancelTask(task.id)
+      toast(t('queueDetail.cancelSent'), 'success')
+      await reload()
+    } catch (e) {
+      toast(String(e), 'error')
     }
   }
 
@@ -597,6 +707,8 @@ export default function QueuePage() {
       onOpen={(id) => navigate(`/queue/${id}`)}
       onResume={resumeTask}
       onCancelPaused={cancelPaused}
+      onStartNow={startNow}
+      onCancelScheduled={cancelScheduled}
     />
   )
 
@@ -786,7 +898,7 @@ export default function QueuePage() {
               <div
                 key={i}
                 className={`py-[18px] px-[22px] grid gap-3 items-center opacity-40 ${i < 2 ? 'border-b border-subtle' : 'border-b-0'}`}
-                style={{ gridTemplateColumns: '48px minmax(0,1fr) 88px 96px 150px 128px 104px' }}
+                style={{ gridTemplateColumns: '48px minmax(0,1fr) 88px 96px 150px 128px 176px' }}
               >
                 <div className="h-3.5 rounded bg-overlay" />
                 <div className="flex flex-col gap-1">
@@ -829,6 +941,16 @@ export default function QueuePage() {
                   {t('queue.sectionWaiting')} ({pendingItems.length})
                 </h3>
                 {pendingItems.map(renderRow)}
+              </section>
+            )}
+
+            {/* 计划任务（scheduled，0.17 P-B）——到点自动转入等待入队 */}
+            {scheduledItems.length > 0 && (
+              <section className="flex flex-col gap-2" data-testid="queue-scheduled-section">
+                <h3 className="text-xs font-semibold text-fg-tertiary uppercase tracking-wide">
+                  {t('queue.sectionScheduled')} ({scheduledItems.length})
+                </h3>
+                {scheduledItems.map(renderRow)}
               </section>
             )}
 
