@@ -7,6 +7,7 @@ import {
   type Task,
   type TaskOutputs,
   type TaskStatus,
+  type TaskType,
 } from '../api/client'
 import { PauseProgressModal } from '../components/PauseProgressModal'
 import { useDialog } from '../components/Dialog'
@@ -16,8 +17,29 @@ import { useTaskEvalProgress } from '../lib/useEvalProgress'
 import MonitorDashboard, { EvalMetricsPanel } from '../components/MonitorDashboard'
 import TaskLogDrawer, { type LogSource, type LogSourceStatus } from '../components/TaskLogDrawer'
 import { useMonitorProgress } from '../lib/useMonitorProgress'
+import { taskKind } from './Queue'
+import { fmtParamValue, jobJumpPath, paramLabel } from './queue/jobUtils'
 
 type Tab = 'overview' | 'log' | 'monitor' | 'eval' | 'outputs' | 'snapshot'
+
+// 0.17 P-H：QueueDetail 按 task_type 差异化。train 保留全部 tab；reg_ai/generate 是
+// 推理/出图循环，无训练 monitor/eval/snapshot，只留 overview + log，结果靠 header 的
+// 「查看结果」深链跳原生页。
+const VISIBLE_TABS_BY_TYPE: Record<TaskType, readonly Tab[]> = {
+  train: ['overview', 'log', 'monitor', 'eval', 'outputs', 'snapshot'],
+  reg_ai: ['overview', 'log'],
+  generate: ['overview', 'log'],
+  // R-5 台账合并：数据作业类 task 走 D5 轻方案（概览 + 日志，结果靠跳转深链）
+  download: ['overview', 'log'],
+  preprocess: ['overview', 'log'],
+  tag: ['overview', 'log'],
+  reg_build: ['overview', 'log'],
+  eval_samples: ['overview', 'log'],
+  eval_clip: ['overview', 'log'],
+  eval_dino: ['overview', 'log'],
+  eval_tag: ['overview', 'log'],
+  eval_ccip: ['overview', 'log'],
+}
 
 const STATUS_BADGE: Record<TaskStatus, string> = {
   pending: 'badge badge-neutral',
@@ -26,6 +48,7 @@ const STATUS_BADGE: Record<TaskStatus, string> = {
   failed: 'badge badge-err',
   canceled: 'badge badge-neutral',
   paused: 'badge badge-warn',
+  scheduled: 'badge badge-neutral',
 }
 
 const TERMINAL: ReadonlyArray<TaskStatus> = ['done', 'failed', 'canceled']
@@ -120,6 +143,13 @@ export default function QueueDetailPage() {
       setTab((prev) => (prev === v ? prev : (v as Tab)))
     }
   }, [location.hash])
+
+  // P-H：task 加载后若当前 tab 因类型收敛而不可见（如带 #monitor 进 generate 详情），
+  // 回落 overview。放在早退之前，和其它 hash effect 一起（rules-of-hooks）。
+  useEffect(() => {
+    const vt = VISIBLE_TABS_BY_TYPE[task ? taskKind(task) : 'train']
+    if (!vt.includes(tab)) setTab('overview')
+  }, [task, tab])
 
   // reload 串行号：SSE 事件密集时多个 getTask 并发在飞，HTTP 响应可能乱序回来。
   // 只让「最后发起」的那次写 state，避免旧快照覆盖新状态（典型故障：恢复后
@@ -236,6 +266,21 @@ export default function QueueDetailPage() {
     }
   }
 
+  // 0.17 P-B — scheduled task 手动提前：立即转 pending 参与排队。
+  const startNow = async () => {
+    if (!task) return
+    setBusy(true)
+    try {
+      await api.startTaskNow(task.id)
+      toast(t('queue.startNowSent', { id: task.id }), 'success')
+      void reload()
+    } catch (e) {
+      toast(String(e), 'error')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const STATUS_LABEL: Record<TaskStatus, string> = {
     pending: t('status.pending'),
     running: t('status.running'),
@@ -243,9 +288,13 @@ export default function QueueDetailPage() {
     failed: t('status.failed'),
     canceled: t('status.canceled'),
     paused: t('status.paused'),
+    scheduled: t('status.scheduled'),
   }
 
-  const tabs: Array<{ key: Tab; label: string }> = [
+  // 按 task_type 过滤可见 tab（task 未加载时先按 train 给全量，加载后收敛）。
+  const kind = task ? taskKind(task) : 'train'
+  const visibleTabs = VISIBLE_TABS_BY_TYPE[kind]
+  const allTabs: Array<{ key: Tab; label: string }> = [
     { key: 'overview', label: t('queueDetail.tabOverview') },
     { key: 'log',      label: t('queueDetail.tabLogs') },
     { key: 'monitor',  label: t('queueDetail.tabMonitor') },
@@ -253,6 +302,7 @@ export default function QueueDetailPage() {
     { key: 'outputs',  label: t('queueDetail.tabOutputs') },
     { key: 'snapshot', label: t('queueDetail.tabSnapshot') },
   ]
+  const tabs = allTabs.filter((tb) => visibleTabs.includes(tb.key))
 
   return (
     <div className="flex flex-col h-full min-h-0 overflow-hidden">
@@ -284,6 +334,29 @@ export default function QueueDetailPage() {
             </span>
           )}
           <span className="flex-1" />
+          {/* P-H 深链：generate/reg_ai 无训练结果 tab，跳原生页看结果 */}
+          {task && kind === 'generate' && (
+            <button
+              onClick={() => navigate(`/tools/generate?task=${task.id}`)}
+              className="btn btn-secondary btn-sm"
+              data-testid="detail-view-generate"
+            >{t('queueDetail.viewInGenerate')}</button>
+          )}
+          {task && kind === 'reg_ai' && task.project_id && task.version_id && (
+            <button
+              onClick={() => navigate(`/projects/${task.project_id}/v/${task.version_id}/reg`)}
+              className="btn btn-secondary btn-sm"
+              data-testid="detail-view-reg"
+            >{t('queueDetail.viewInReg')}</button>
+          )}
+          {/* R-5：数据作业类 task 跳原生步骤页（download→项目下载页、tag→打标页…） */}
+          {task && jobJumpPath(task) && (
+            <button
+              onClick={() => navigate(jobJumpPath(task)!)}
+              className="btn btn-secondary btn-sm"
+              data-testid="detail-view-job-source"
+            >{t('queue.jobs.jump')} →</button>
+          )}
           {isLive && status === 'running' && task?.is_pausable && (
             <button onClick={pauseRunning} disabled={busy || pauseModalOpen} className="btn btn-sm"
               data-testid="detail-pause-btn"
@@ -293,6 +366,19 @@ export default function QueueDetailPage() {
           {isLive && (
             <button onClick={cancel} disabled={busy} className="btn btn-sm bg-warn-soft border border-warn text-warn"
             >{t('queueDetail.cancelTask')}</button>
+          )}
+          {/* 0.17 P-B — scheduled：可手动提前 / 取消计划 */}
+          {status === 'scheduled' && (
+            <>
+              <button onClick={startNow} disabled={busy} className="btn btn-primary btn-sm"
+                data-testid="detail-startnow-btn"
+                title={t('queue.startNowHint')}
+              >{t('queue.startNow')}</button>
+              <button onClick={cancel} disabled={busy}
+                className="btn btn-sm bg-warn-soft border border-warn text-warn"
+                title={t('queue.cancelScheduledHint')}
+              >{t('queue.cancelScheduled')}</button>
+            </>
           )}
           {status === 'paused' && (
             <>
@@ -413,6 +499,7 @@ function OverviewTab({ task }: { task: Task }) {
   const statusLabel: Record<string, string> = {
     pending: t('status.pending'), running: t('status.running'), done: t('status.done'),
     failed: t('status.failed'), canceled: t('status.canceled'), paused: t('status.paused'),
+    scheduled: t('status.scheduled'),
   }
   const items: Array<{ label: string; value: React.ReactNode; mono?: boolean }> = [
     { label: 'ID',     value: <code className="font-mono">{task.id}</code> },
@@ -421,6 +508,10 @@ function OverviewTab({ task }: { task: Task }) {
     { label: t('common.status'), value: <span className={STATUS_BADGE[task.status]}>{task.status === 'running' && <span className="dot dot-running" />}{statusLabel[task.status]}</span> },
     { label: t('queueDetail.priority'), value: task.priority, mono: true },
     { label: t('queueDetail.enqueuedAt'), value: fmtTime(task.created_at) },
+    // 0.17 P-B — 计划任务显示计划开始时间（提升为 pending 后保留作记录）。
+    ...(task.scheduled_at
+      ? [{ label: t('queueDetail.scheduledAt'), value: fmtTime(task.scheduled_at) }]
+      : []),
     { label: t('queueDetail.startedAt'), value: fmtTime(task.started_at) },
     { label: t('queueDetail.finishedAt'), value: fmtTime(task.finished_at) },
     { label: t('queueDetail.duration'), value: fmtDuration(task.started_at, task.finished_at), mono: true },
@@ -446,6 +537,16 @@ function OverviewTab({ task }: { task: Task }) {
   }
   if (task.error_msg) {
     items.push({ label: t('common.error'), value: <code className="font-mono text-xs break-all text-err">{task.error_msg}</code> })
+  }
+  // R-5：数据作业类 task 的参数全字段（用户在原生页面配置的内容；映射人话标签，
+  // 未映射退回原 key）。train/reg_ai 无 params 不进此分支。
+  if (task.params_decoded && typeof task.params_decoded === 'object') {
+    for (const [k, v] of Object.entries(task.params_decoded)) {
+      items.push({
+        label: paramLabel(k, t),
+        value: <span className="font-mono text-xs break-all">{fmtParamValue(v, t)}</span>,
+      })
+    }
   }
 
   return (
@@ -576,7 +677,8 @@ function useEvalLogSource(
     for (const j of jobs) {
       if (buffersRef.current[j.id] === undefined) {
         buffersRef.current[j.id] = ''
-        void api.getJobLog(j.id).then((r) => {
+        // R-5：eval 作业与任务同台账，日志走统一 /api/logs/{id}
+        void api.getLog(j.id).then((r) => {
           if (!alive) return
           buffersRef.current[j.id] = r.content || ''
           setBuffers({ ...buffersRef.current })

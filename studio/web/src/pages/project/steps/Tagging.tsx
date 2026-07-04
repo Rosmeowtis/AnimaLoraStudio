@@ -126,7 +126,7 @@ export default function TaggingPage() {
 
   const [tagger, setTagger] = useState<TaggerName>('wd14')
   const [taggerStatus, setTaggerStatus] = useState<TaggerStatus | null>(null)
-  const [outputFormat, setOutputFormat] = useState<'txt' | 'json'>('txt')
+  // 落盘格式跟着产物走（LLM json preset → .json，其余 → .txt），不再由请求指定。
   const [onExisting, setOnExisting] = useState<'overwrite' | 'skip' | 'append'>('overwrite')
   // 触发词：初值从 activeVersion 取（持久化在 version 表）；启动打标时一并提交，
   // 后端会同步落库 + 传给 worker prepend 到每张 caption。
@@ -293,7 +293,7 @@ export default function TaggingPage() {
       const overrides = wd14_overrides ?? cltagger_overrides ?? llm_overrides
       const trigger = triggerWord.trim()
       const j = await api.startTag(project.id, activeVersion.id, {
-        tagger, output_format: outputFormat, on_existing: onExisting,
+        tagger, on_existing: onExisting,
         scope,
         wd14_overrides, cltagger_overrides, llm_overrides,
         // 传 trigger 永远，让 server 决定是否落库（与现有值比较），空串显式清空
@@ -334,12 +334,18 @@ export default function TaggingPage() {
         },
       ]}
       actions={
+        /* 样式对齐项目页「新建项目」（btn-primary btn-sm + icon + 文字） */
         <button
           onClick={startTagging}
           disabled={isLive || !taggerStatus?.ok}
-          className="btn btn-primary"
+          className="btn btn-primary btn-sm"
         >
-          {isLive ? t('tag.taggingBtn') : taggerStatus === null ? t('tag.checkingBtn') : t('tag.startBtn')}
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M8 5v14l11-7z" />
+          </svg>
+          <span>
+            {isLive ? t('tag.taggingBtn') : taggerStatus === null ? t('tag.checkingBtn') : t('tag.startBtn')}
+          </span>
         </button>
       }
     >
@@ -411,18 +417,6 @@ export default function TaggingPage() {
                 <option key={f} value={f}>{f}</option>
               ))}
               <option value="validation">{t('tag.scopeValidation')}</option>
-            </select>
-
-            <span className="text-dim">|</span>
-            <span className="text-fg-tertiary">format</span>
-            <select
-              value={outputFormat}
-              onChange={(e) => setOutputFormat(e.target.value as 'txt' | 'json')}
-              className="input text-sm"
-              style={{ padding: '3px 8px' }}
-            >
-              <option value="txt">.txt</option>
-              <option value="json">.json</option>
             </select>
 
             <span className="text-dim">|</span>

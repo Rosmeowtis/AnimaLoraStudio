@@ -485,9 +485,10 @@ export interface ModelsConfig {
 }
 
 export interface QueueConfig {
-  /** PP10.2：默认 false，训练时推迟 tag/reg_build job 避免 GPU OOM。
-   * 用户开后允许 GPU job 与训练并行（自己确认显存够）。 */
-  allow_gpu_during_train: boolean
+  /** R-1 资源档位：exclusive（训练/正则 AI/出图/评估出图）运行时是否放行
+   *  light 档（打标/超分/正则构建/评估指标，小模型）。默认 true。独占档
+   *  永不并行，不受此开关影响。 */
+  light_tasks_during_train: boolean
 }
 
 /** Phase 2 commit 14 — 测试出图 daemon 行为。 */
@@ -834,7 +835,9 @@ export interface ProjectDetail extends ProjectSummary {
 // ---- jobs (PP2) -----------------------------------------------------------
 
 export type JobStatus = 'pending' | 'running' | 'done' | 'failed' | 'canceled'
-export type JobKind = 'download' | 'preprocess' | 'tag' | 'reg_build'
+export type JobKind =
+  | 'download' | 'preprocess' | 'tag' | 'reg_build'
+  | 'eval_samples' | 'eval_clip' | 'eval_dino' | 'eval_tag' | 'eval_ccip'
 
 export interface Job {
   id: number
@@ -844,6 +847,8 @@ export interface Job {
   params: string
   params_decoded?: Record<string, unknown> | null
   status: JobStatus
+  /** v16 — 入队时间；老作业 NULL（入队时刻未记录，UI 显示 —）。 */
+  created_at?: number | null
   started_at: number | null
   finished_at: number | null
   pid: number | null
@@ -1474,7 +1479,18 @@ export interface XformersInstallResult {
   restart_required: boolean
 }
 
-export type TaskStatus = 'pending' | 'running' | 'done' | 'failed' | 'canceled' | 'paused'
+export type TaskStatus =
+  'pending' | 'running' | 'done' | 'failed' | 'canceled' | 'paused' | 'scheduled'
+
+/** tasks.task_type 的合法值。R-3 台账合并起含九类数据作业 kind。
+ *  档位：exclusive = train/reg_ai/generate/eval_samples；light = 其余；io = download。 */
+export type TaskType =
+  | 'train' | 'reg_ai' | 'generate'
+  | 'download' | 'preprocess' | 'tag' | 'reg_build'
+  | 'eval_samples' | 'eval_clip' | 'eval_dino' | 'eval_tag' | 'eval_ccip'
+
+/** R-5 档位视图参数：GPU 视图 = exclusive，数据视图 = data（light+io）。 */
+export type QueueResourceClass = 'exclusive' | 'data'
 
 /** Terminal task statuses — UI 一般禁用这些上的操作按钮（cancel / pause 等）。
  *  `paused` **不**进 terminal — 它可被 resume 复活。 */
@@ -1486,6 +1502,10 @@ export interface Task {
   id: number
   name: string
   config_name: string
+  /** 0.17 P-D — 后端权威任务类型（_v5 migration 加，值 train/reg_ai/generate）。
+   *  老行经 `NOT NULL DEFAULT 'train'` 的 ALTER 自动 backfill；此处可选仅为兼容
+   *  未带该字段的测试 mock，运行时恒有值。 */
+  task_type?: TaskType
   status: TaskStatus
   priority: number
   created_at: number
@@ -1511,6 +1531,13 @@ export interface Task {
   paused_step?: number | null
   /** ADR 0006 PR-2 — paused 时间（unix 秒）。 */
   paused_at?: number | null
+  /** 0.17 P-B — 计划开始时间（unix 秒）。status='scheduled' 时有值；到点提升为
+   *  pending 后保留作记录。非计划任务恒 null。 */
+  scheduled_at?: number | null
+  /** R-2/_v17 — 数据作业类 task 的 kind 专属参数 JSON；train/reg_ai 恒 null。 */
+  params?: string | null
+  /** 后端读路径附带解码（同旧 jobs DAO 约定）。 */
+  params_decoded?: Record<string, unknown> | null
   /** ADR 0006 PR-4 — is_pausable 信号（§8.1）：UI 用来决定是否显示暂停
    *  按钮。supervisor 跑得起来时由 server enrich；空载默认 false。 */
   is_pausable?: boolean
@@ -1526,6 +1553,14 @@ export interface Task {
   /** ADR 0006 Addendum 2 — is_resumable 信号：status ∈ paused/failed/canceled
    *  且恢复点文件在盘上。UI 用来决定是否显示"继续训练"按钮。 */
   is_resumable?: boolean
+}
+
+/** 0.17 P-E — /api/queue?group=history 的分页响应。 */
+export interface QueueHistoryPage {
+  items: Task[]
+  total: number
+  page: number
+  page_size: number
 }
 
 /** ADR 0006 PR-2 — GET /api/queue/hold 返回。`held=true` 时 UI 顶部
@@ -2260,15 +2295,15 @@ export const api = {
       body: JSON.stringify({ crops }),
     }),
 
-  getJob: (jid: number) => req<Job>(`/api/jobs/${jid}`),
-  getJobLog: (jid: number, tail?: number) => {
-    const qs = tail ? `?tail=${tail}` : ''
-    return req<{ job_id: number; content: string; size: number }>(
-      `/api/jobs/${jid}/log${qs}`
-    )
-  },
+  // R-5 台账合并：/api/jobs* 已删，作业与任务同源 /api/queue（单一 ID 空间）。
+  // getJob / cancelJob 保留函数名给步骤页（Download/Tagging/Reg/Preprocess），
+  // 内部改指 /api/queue；kind 由 task_type 派生。
+  getJob: (jid: number) =>
+    req<Task & { kind?: JobKind }>(`/api/queue/${jid}`).then(
+      (t) => ({ ...t, kind: (t.task_type ?? 'train') as JobKind }) as unknown as Job,
+    ),
   cancelJob: (jid: number) =>
-    req<{ job_id: number; canceled: boolean }>(`/api/jobs/${jid}/cancel`, {
+    req<{ task_id: number; canceled: boolean }>(`/api/queue/${jid}/cancel`, {
       method: 'POST',
     }),
   getLatestVersionJob: (
@@ -2288,10 +2323,10 @@ export const api = {
     vid: number,
     body: {
       tagger: TaggerName
-      output_format?: 'txt' | 'json'
       /**
        * 已有 caption 文件时的策略：overwrite（默认覆盖）/ skip（保留原文件）
        * / append（tag 级 merge + dedupe 后写回原格式）。
+       * 落盘格式跟着产物走（LLM json preset → .json，其余 → .txt），不再由请求指定。
        */
       on_existing?: 'overwrite' | 'skip' | 'append'
       /**
@@ -2530,10 +2565,17 @@ export const api = {
       `/api/projects/${pid}/versions/${vid}/config/save_as_preset`,
       { method: 'POST', body: JSON.stringify({ name, overwrite }) }
     ),
-  enqueueVersionTraining: (pid: number, vid: number) =>
+  /** 0.17 P-B — scheduledAt（unix 秒）给了则建成 scheduled（计划任务），到点
+   *  由 supervisor 提升为 pending；不给立即入队（原行为）。 */
+  enqueueVersionTraining: (pid: number, vid: number, opts?: { scheduledAt?: number }) =>
     req<Task>(
       `/api/projects/${pid}/versions/${vid}/queue`,
-      { method: 'POST' }
+      {
+        method: 'POST',
+        ...(opts?.scheduledAt != null
+          ? { body: JSON.stringify({ scheduled_at: opts.scheduledAt }) }
+          : {}),
+      }
     ),
 
   // Curation (PP3) -------------------------------------------------------
@@ -2627,6 +2669,34 @@ export const api = {
     const qs = params.length ? `?${params.join('&')}` : ''
     return req<{ items: Task[] }>(`/api/queue${qs}`).then((r) => r.items)
   },
+  // 0.17 P-A/P-C —— 队列页分区数据源。live = 进行中 + 等待（running/paused/pending），
+  // 不分页；q 搜 name/config_name。
+  // 不分页；q 搜 name/config_name；type 按 task_type 过滤（0.17 P-F）。
+  listQueueLive: (q?: string, type?: TaskType, resourceClass?: QueueResourceClass) => {
+    const params = new URLSearchParams({ group: 'live' })
+    if (q) params.set('q', q)
+    if (type) params.set('types', type)
+    if (resourceClass) params.set('resource_class', resourceClass)
+    return req<{ items: Task[] }>(`/api/queue?${params}`).then((r) => r.items)
+  },
+  // 0.17 P-E —— history = 已结束（done/failed/canceled），后端分页。status 传终态
+  // 做子过滤，q 搜 name/config_name，type 按 task_type 过滤（P-F）。返回
+  // { items, total, page, page_size }。
+  listQueueHistory: (opts: {
+    page: number; pageSize: number; q?: string; status?: TaskStatus;
+    type?: TaskType; resourceClass?: QueueResourceClass
+  }) => {
+    const params = new URLSearchParams({
+      group: 'history',
+      page: String(opts.page),
+      page_size: String(opts.pageSize),
+    })
+    if (opts.q) params.set('q', opts.q)
+    if (opts.status) params.set('status', opts.status)
+    if (opts.type) params.set('types', opts.type)
+    if (opts.resourceClass) params.set('resource_class', opts.resourceClass)
+    return req<QueueHistoryPage>(`/api/queue?${params}`)
+  },
   getTask: (id: number) => req<Task>(`/api/queue/${id}`),
   enqueue: (payload: { config_name: string; name?: string; priority?: number }) =>
     req<Task>('/api/queue', {
@@ -2635,6 +2705,11 @@ export const api = {
     }),
   cancelTask: (id: number) =>
     req<{ task_id: number; canceled: boolean }>(`/api/queue/${id}/cancel`, {
+      method: 'POST',
+    }),
+  /** 0.17 P-B — scheduled task 手动提前：立即转 pending 参与调度。非 scheduled 409。 */
+  startTaskNow: (id: number) =>
+    req<{ task_id: number; status: string }>(`/api/queue/${id}/start_now`, {
       method: 'POST',
     }),
   retryTask: (id: number) =>
@@ -2862,20 +2937,6 @@ export const api = {
       `/api/projects/${pid}/versions/${vid}/eval/run`,
       { method: 'POST', body: JSON.stringify(body) },
     ),
-
-  // Queue import / export ---------------------------------------------
-  /** 队列导出直链。响应带 Content-Disposition: attachment,<a href download>
-   * 触发就走浏览器原生下载。后端 publish queue_export_ready/_failed SSE
-   * 供前端清 app-side "导出中..." 状态。 */
-  queueExportUrl: (ids?: ReadonlyArray<number>) => {
-    const qs = ids && ids.length ? `?ids=${ids.join(',')}` : ''
-    return `/api/queue/export${qs}`
-  },
-  importQueue: (payload: unknown) =>
-    req<ImportResult>('/api/queue/import', {
-      method: 'POST',
-      body: JSON.stringify({ payload }),
-    }),
 
   // Datasets -----------------------------------------------------------
   listDatasets: (path?: string) => {
