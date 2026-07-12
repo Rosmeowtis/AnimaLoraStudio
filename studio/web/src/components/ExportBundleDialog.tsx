@@ -10,6 +10,8 @@ export interface BundleExportOpts {
   reg: boolean
   regCaptions: boolean
   includeConfig: boolean
+  trainLatentCache: boolean
+  regLatentCache: boolean
   destination: BundleExportDestination
 }
 
@@ -25,6 +27,8 @@ export default function ExportBundleDialog({ onConfirm, onCancel }: Props) {
   const [reg, setReg] = useState(false)
   const [regCaptions, setRegCaptions] = useState(false)
   const [includeConfig, setIncludeConfig] = useState(false)
+  const [trainLatentCache, setTrainLatentCache] = useState(false)
+  const [regLatentCache, setRegLatentCache] = useState(false)
   const [destination, setDestination] = useState<BundleExportDestination>('download')
 
   const nothingSelected = !train && !reg && !includeConfig
@@ -32,7 +36,10 @@ export default function ExportBundleDialog({ onConfirm, onCancel }: Props) {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
     if (nothingSelected) return
-    onConfirm({ train, trainCaptions, reg, regCaptions, includeConfig, destination })
+    onConfirm({
+      train, trainCaptions, reg, regCaptions, includeConfig,
+      trainLatentCache, regLatentCache, destination,
+    })
   }
 
   return (
@@ -96,16 +103,28 @@ export default function ExportBundleDialog({ onConfirm, onCancel }: Props) {
             </span>
           </label>
           {train && (
-            <label className="flex items-center gap-2 cursor-pointer pl-5">
-              <input
-                type="checkbox"
-                checked={trainCaptions}
-                onChange={(e) => setTrainCaptions(e.target.checked)}
-              />
-              <span className="text-sm text-fg-secondary">
-                {t('layout.exportBundleCaptions')}
-              </span>
-            </label>
+            <>
+              <label className="flex items-center gap-2 cursor-pointer pl-5">
+                <input
+                  type="checkbox"
+                  checked={trainCaptions}
+                  onChange={(e) => setTrainCaptions(e.target.checked)}
+                />
+                <span className="text-sm text-fg-secondary">
+                  {t('layout.exportBundleCaptions')}
+                </span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer pl-5">
+                <input
+                  type="checkbox"
+                  checked={trainLatentCache}
+                  onChange={(e) => setTrainLatentCache(e.target.checked)}
+                />
+                <span className="text-sm text-fg-secondary">
+                  {t('layout.exportBundleLatentCache')}
+                </span>
+              </label>
+            </>
           )}
         </div>
 
@@ -122,16 +141,28 @@ export default function ExportBundleDialog({ onConfirm, onCancel }: Props) {
             </span>
           </label>
           {reg && (
-            <label className="flex items-center gap-2 cursor-pointer pl-5">
-              <input
-                type="checkbox"
-                checked={regCaptions}
-                onChange={(e) => setRegCaptions(e.target.checked)}
-              />
-              <span className="text-sm text-fg-secondary">
-                {t('layout.exportBundleCaptions')}
-              </span>
-            </label>
+            <>
+              <label className="flex items-center gap-2 cursor-pointer pl-5">
+                <input
+                  type="checkbox"
+                  checked={regCaptions}
+                  onChange={(e) => setRegCaptions(e.target.checked)}
+                />
+                <span className="text-sm text-fg-secondary">
+                  {t('layout.exportBundleCaptions')}
+                </span>
+              </label>
+              <label className="flex items-center gap-2 cursor-pointer pl-5">
+                <input
+                  type="checkbox"
+                  checked={regLatentCache}
+                  onChange={(e) => setRegLatentCache(e.target.checked)}
+                />
+                <span className="text-sm text-fg-secondary">
+                  {t('layout.exportBundleLatentCache')}
+                </span>
+              </label>
+            </>
           )}
         </div>
 
