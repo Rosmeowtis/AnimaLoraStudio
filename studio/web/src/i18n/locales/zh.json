@@ -1912,8 +1912,7 @@
       "dedupe": "去重审核",
       "upscale": "放大",
       "crop": "裁剪",
-      "inpaint": "涂抹",
-      "inpaintTitle": "即将上线：画笔涂抹（取色 + 高斯）"
+      "inpaint": "涂抹"
     },
     "imagesTitle": "图片",
     "totalCount": "共 {{n}} 张",
@@ -2024,6 +2023,39 @@
     "rrFromCrops": "裁剪框 AR",
     "toastStarted": "开始裁剪 #{{id}}",
     "toastNoCrops": "没有可提交的裁剪框（先在画布上画几个框）"
+  },
+  "preprocessInpaint": {
+    "subtitle": "放大 / 裁剪 / 涂抹 — 涂抹工具",
+    "saveActive": "保存当前图",
+    "saveAll": "保存全部 ({{n}})",
+    "clearActive": "撤销修改",
+    "filter": {
+      "all": "全部",
+      "pending": "未涂抹",
+      "edited": "已涂抹"
+    },
+    "filmstripEmpty": {
+      "all": "工作集是空的。",
+      "pending": "所有图都已有笔画。",
+      "edited": "还没有涂抹过任何图。"
+    },
+    "loading": "加载工作集...",
+    "emptyWorkspace": "工作集为空，",
+    "goToOverview": "回总览页看看",
+    "canvasLoading": "加载原图...",
+    "canvasHint": "滚轮缩放 · 空格拖拽平移 · Alt 点击取色",
+    "zoomFit": "适应窗口",
+    "brushColor": "颜色",
+    "colorWheel": "色轮选择（含取色器 / RGB 输入）",
+    "recentColors": "历史颜色",
+    "brushSize": "大小",
+    "brushHardness": "硬度",
+    "undo": "撤销",
+    "redo": "重做",
+    "toastNotReady": "图片还没加载完成",
+    "toastSaved": "已保存 {{name}}",
+    "toastSavedAll": "已保存 {{n}} 张",
+    "toastSavedAllPartial": "保存完成：成功 {{ok}} 张，失败 {{failed}} 张"
   },
   "steps": {
     "download": { "title": "数据集", "subtitle": "Booru 抓取 + 本地上传" },

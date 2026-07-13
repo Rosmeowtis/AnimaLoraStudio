@@ -1912,8 +1912,7 @@
       "dedupe": "Dedupe review",
       "upscale": "Upscale",
       "crop": "Crop",
-      "inpaint": "Inpaint",
-      "inpaintTitle": "Coming soon: brush inpaint (palette + Gaussian)"
+      "inpaint": "Inpaint"
     },
     "imagesTitle": "Images",
     "totalCount": "{{n}} total",
@@ -2024,6 +2023,39 @@
     "rrFromCrops": "crop AR",
     "toastStarted": "Crop job #{{id}} started",
     "toastNoCrops": "No crops to submit (draw at least one rect)"
+  },
+  "preprocessInpaint": {
+    "subtitle": "Upscale / crop / inpaint — Inpaint tool",
+    "saveActive": "Save current image",
+    "saveAll": "Save all ({{n}})",
+    "clearActive": "Discard edits",
+    "filter": {
+      "all": "All",
+      "pending": "Untouched",
+      "edited": "Painted"
+    },
+    "filmstripEmpty": {
+      "all": "Workspace is empty.",
+      "pending": "Every image already has strokes.",
+      "edited": "No image has been painted yet."
+    },
+    "loading": "Loading workspace...",
+    "emptyWorkspace": "Workspace is empty,",
+    "goToOverview": "go to Overview",
+    "canvasLoading": "Loading full-resolution image...",
+    "canvasHint": "Wheel to zoom · Space-drag to pan · Alt-click to pick color",
+    "zoomFit": "Fit",
+    "brushColor": "Color",
+    "colorWheel": "Color wheel (with eyedropper / RGB input)",
+    "recentColors": "Recent colors",
+    "brushSize": "Size",
+    "brushHardness": "Hardness",
+    "undo": "Undo",
+    "redo": "Redo",
+    "toastNotReady": "Image is still loading",
+    "toastSaved": "Saved {{name}}",
+    "toastSavedAll": "Saved {{n}} images",
+    "toastSavedAllPartial": "Done: {{ok}} saved, {{failed}} failed"
   },
   "steps": {
     "download": { "title": "Dataset", "subtitle": "Booru scraping + local upload" },
