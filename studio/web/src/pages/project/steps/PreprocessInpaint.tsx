@@ -10,7 +10,9 @@ import {
 import Filmstrip from '../../../components/preprocess/Filmstrip'
 import InpaintCanvas, {
   renderInpaintedBlob,
+  renderMaskBlob,
   type InpaintCanvasHandle,
+  type InpaintMode,
   type InpaintStroke,
 } from '../../../components/preprocess/InpaintCanvas'
 import PreprocessToolsBar from '../../../components/preprocess/PreprocessToolsBar'
@@ -25,6 +27,12 @@ interface Ctx {
 }
 
 type Filter = 'all' | 'pending' | 'edited'
+
+/** 统一编辑历史条目：涂抹与 mask 笔画共用一条时间线。 */
+interface HistoryEntry {
+  kind: InpaintMode
+  stroke: InpaintStroke
+}
 
 interface BrushState {
   color: string
@@ -42,16 +50,16 @@ function splitRel(name: string): { folder: string; filename: string } {
   }
 }
 
-/** 状态模型对齐裁剪页：strokesByImage 存笔画矢量，随便切图改动都留在内存，
- *  统一提交。只有活动图挂真实 canvas（InpaintCanvas），「保存全部」对
- *  非活动图走 renderInpaintedBlob 离屏重放。 */
+/** 状态模型对齐裁剪页：双数据面双桶（strokesByImage / maskStrokesByImage），
+ *  随便切图改动都留在内存，保存按当前模式分发（§9 决策 2）。只有活动图挂
+ *  真实 canvas，「保存全部」对非活动图走离屏重放。 */
 export default function PreprocessInpaintPage() {
   const { t } = useTranslation()
   const { project, activeVersion, reload } = useOutletContext<Ctx>()
   const { toast } = useToast()
   const vid = activeVersion?.id ?? 0
 
-  // ────── Workspace data（复用 crop workspace：name + w/h + mtime）──────
+  // ────── Workspace data（复用 crop workspace：name + w/h + mtime + mask_mtime）──────
   const [images, setImages] = useState<CropWorkspaceItem[]>([])
   const [loading, setLoading] = useState(true)
 
@@ -70,9 +78,14 @@ export default function PreprocessInpaintPage() {
   useEffect(() => { void refreshWorkspace() }, [refreshWorkspace])
 
   // ────── Editor state ──────
+  // 统一编辑历史：涂抹与 mask 笔画混合入同一时间线 —— 模式只是笔刷，
+  // dirty / undo / 保存都跨模式共用，切模式不改变页面状态语义。
+  const [mode, setMode] = useState<InpaintMode>('paint')
+  // 画笔 / 橡皮跨模式共用：涂抹橡皮擦未保存笔画，遮罩橡皮擦 mask
+  const [erase, setErase] = useState(false)
   const [activeName, setActiveName] = useState<string | null>(null)
-  const [strokesByImage, setStrokesByImage] = useState<Record<string, InpaintStroke[]>>({})
-  const [redoByImage, setRedoByImage] = useState<Record<string, InpaintStroke[]>>({})
+  const [historyByImage, setHistoryByImage] = useState<Record<string, HistoryEntry[]>>({})
+  const [redoByImage, setRedoByImage] = useState<Record<string, HistoryEntry[]>>({})
   const [filter, setFilter] = useState<Filter>('all')
   const [busy, setBusy] = useState(false)
 
@@ -85,7 +98,6 @@ export default function PreprocessInpaintPage() {
 
   const canvasRef = useRef<InpaintCanvasHandle | null>(null)
 
-  // 保存产物可能改名（X.jpg → X.png），沿用裁剪页的 activeName 兜底
   useEffect(() => {
     if (images.length === 0) return
     if (!activeName || !images.find((im) => im.name === activeName)) {
@@ -98,54 +110,74 @@ export default function PreprocessInpaintPage() {
     () => images.find((im) => im.name === activeName) ?? null,
     [images, activeName],
   )
-  const activeStrokes = activeName ? (strokesByImage[activeName] ?? []) : []
+  const activeHistory = activeName ? (historyByImage[activeName] ?? []) : []
   const activeRedo = activeName ? (redoByImage[activeName] ?? []) : []
-
-  const editedNames = useMemo(
-    () => Object.entries(strokesByImage)
-      .filter(([, s]) => s.length > 0)
-      .map(([n]) => n),
-    [strokesByImage],
+  const activePaintStrokes = useMemo(
+    () => activeHistory.filter((h) => h.kind === 'paint').map((h) => h.stroke),
+    [activeHistory],
+  )
+  const activeMaskStrokes = useMemo(
+    () => activeHistory.filter((h) => h.kind === 'mask').map((h) => h.stroke),
+    [activeHistory],
   )
 
-  const counts = useMemo(() => ({
-    all: images.length,
-    pending: images.filter((im) => (strokesByImage[im.name] ?? []).length === 0).length,
-    edited: images.filter((im) => (strokesByImage[im.name] ?? []).length > 0).length,
-  }), [images, strokesByImage])
+  /** dirty 图集合 = 任一数据面有未保存笔画（保存全部 / filter / 计数共用）。 */
+  const editedNames = useMemo(
+    () => Object.entries(historyByImage)
+      .filter(([, h]) => h.length > 0)
+      .map(([n]) => n),
+    [historyByImage],
+  )
+
+  const counts = useMemo(() => {
+    const edited = images.filter((im) => (historyByImage[im.name] ?? []).length > 0).length
+    return { all: images.length, pending: images.length - edited, edited }
+  }, [images, historyByImage])
 
   const filteredImages = useMemo(() => images.filter((im) => {
-    const n = (strokesByImage[im.name] ?? []).length
+    const n = (historyByImage[im.name] ?? []).length
     if (filter === 'pending') return n === 0
     if (filter === 'edited') return n > 0
     return true
-  }), [images, filter, strokesByImage])
+  }), [images, filter, historyByImage])
 
   const rawUrl = useCallback((im: CropWorkspaceItem) => {
     const { folder, filename } = splitRel(im.name)
-    // size=0 → 原图直出（涂抹必须在原图分辨率上编辑，不能用 1024 缩略图）
     return api.versionThumbUrl(project.id, vid, 'train', filename, folder, 0)
       + `&_=${im.mtime}`
   }, [project.id, vid])
 
-  // ────── Stroke mutations ──────
+  const maskBaseUrlFor = useCallback((im: CropWorkspaceItem): string | null => {
+    if (im.mask_mtime == null) return null
+    return api.maskUrl(project.id, vid, im.name) + `&_=${im.mask_mtime}`
+  }, [project.id, vid])
+
+  // ────── Stroke mutations（统一时间线，undo/redo 跨模式）──────
   const pushRecentColor = useCallback((hex: string) => {
     setRecentColors((prev) => [hex, ...prev.filter((c) => c !== hex)].slice(0, 8))
   }, [setRecentColors])
 
-  const onStrokeEnd = useCallback((s: InpaintStroke) => {
+  const pushEntry = useCallback((entry: HistoryEntry) => {
     if (!activeName) return
-    setStrokesByImage((prev) => ({
+    setHistoryByImage((prev) => ({
       ...prev,
-      [activeName]: [...(prev[activeName] ?? []), s],
+      [activeName]: [...(prev[activeName] ?? []), entry],
     }))
     setRedoByImage((prev) => ({ ...prev, [activeName]: [] }))
+  }, [activeName])
+
+  const onStrokeEnd = useCallback((s: InpaintStroke) => {
+    pushEntry({ kind: 'paint', stroke: s })
     pushRecentColor(s.color)
-  }, [activeName, pushRecentColor])
+  }, [pushEntry, pushRecentColor])
+
+  const onMaskStrokeEnd = useCallback((s: InpaintStroke) => {
+    pushEntry({ kind: 'mask', stroke: s })
+  }, [pushEntry])
 
   const undo = useCallback(() => {
     if (!activeName) return
-    setStrokesByImage((prev) => {
+    setHistoryByImage((prev) => {
       const cur = prev[activeName] ?? []
       if (cur.length === 0) return prev
       const last = cur[cur.length - 1]
@@ -163,9 +195,9 @@ export default function PreprocessInpaintPage() {
       const cur = prev[activeName] ?? []
       if (cur.length === 0) return prev
       const last = cur[cur.length - 1]
-      setStrokesByImage((s) => ({
-        ...s,
-        [activeName]: [...(s[activeName] ?? []), last],
+      setHistoryByImage((h) => ({
+        ...h,
+        [activeName]: [...(h[activeName] ?? []), last],
       }))
       return { ...prev, [activeName]: cur.slice(0, -1) }
     })
@@ -173,11 +205,10 @@ export default function PreprocessInpaintPage() {
 
   const clearActive = useCallback(() => {
     if (!activeName) return
-    setStrokesByImage((prev) => ({ ...prev, [activeName]: [] }))
+    setHistoryByImage((prev) => ({ ...prev, [activeName]: [] }))
     setRedoByImage((prev) => ({ ...prev, [activeName]: [] }))
   }, [activeName])
 
-  // Ctrl+Z / Ctrl+Shift+Z（表单聚焦时不劫持）
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== 'z') return
@@ -201,41 +232,82 @@ export default function PreprocessInpaintPage() {
     pushRecentColor(hex)
   }, [setBrush, pushRecentColor])
 
-  // ────── Save / restore ──────
-  const clearSaved = useCallback((name: string) => {
-    setStrokesByImage((prev) => {
-      const next = { ...prev }
-      delete next[name]
-      return next
-    })
-    setRedoByImage((prev) => {
-      const next = { ...prev }
-      delete next[name]
-      return next
-    })
+  // ────── Save（保存 = 该图全部未保存改动，两个数据面一次写完）──────
+  /** 保存成功后从历史滤掉对应数据面的 entries（redo 时间线随之作废）。 */
+  const clearSavedKind = useCallback((name: string, kind: InpaintMode) => {
+    setHistoryByImage((prev) => ({
+      ...prev,
+      [name]: (prev[name] ?? []).filter((h) => h.kind !== kind),
+    }))
+    setRedoByImage((prev) => ({ ...prev, [name]: [] }))
   }, [])
+
+  /** 单图两面保存。涂抹先行 —— 产物可能改名（X.jpg→X.png），mask 的 PUT
+   *  必须用新 name（旧源文件已删，服务端按 name 校验源图存在）。
+   *  返回保存后的 name（无涂抹改动时原样）。 */
+  const saveImageBoth = useCallback(async (
+    im: CropWorkspaceItem,
+    paintStrokes: InpaintStroke[],
+    maskStrokes: InpaintStroke[],
+    exporters?: {
+      paint: () => Promise<Blob | null>
+      mask: () => Promise<{ blob: Blob; coverage: number } | null>
+    },
+  ): Promise<string> => {
+    let name = im.name
+    if (paintStrokes.length > 0) {
+      const blob = exporters
+        ? await exporters.paint()
+        : await renderInpaintedBlob(rawUrl(im), im.w, im.h, paintStrokes)
+      if (!blob) throw new Error('canvas not ready')
+      const res = await api.saveInpaintTrain(project.id, vid, name, blob)
+      clearSavedKind(im.name, 'paint')
+      name = res.name
+    }
+    if (maskStrokes.length > 0) {
+      const res = exporters
+        ? await exporters.mask()
+        : await renderMaskBlob(maskBaseUrlFor(im), im.w, im.h, maskStrokes)
+      if (res === null) {
+        if (im.mask_mtime != null) await api.deleteMaskTrain(project.id, vid, name)
+      } else {
+        await api.saveMaskTrain(project.id, vid, name, res.blob)
+      }
+      clearSavedKind(im.name, 'mask')
+    }
+    return name
+  }, [project.id, vid, rawUrl, maskBaseUrlFor, clearSavedKind])
 
   const saveActive = useCallback(async () => {
     if (!activeName || !activeImage) return
-    const blob = await canvasRef.current?.exportBlob()
-    if (!blob) {
-      toast(t('preprocessInpaint.toastNotReady'), 'error')
-      return
-    }
+    if (activeHistory.length === 0) return
     setBusy(true)
     try {
-      const res = await api.saveInpaintTrain(project.id, vid, activeName, blob)
-      clearSaved(activeName)
-      toast(t('preprocessInpaint.toastSaved', { name: res.name }), 'success')
+      // 活动图用挂载中的 canvas 导出（所见即所得），非活动图才走离屏重放
+      const newName = await saveImageBoth(
+        activeImage, activePaintStrokes, activeMaskStrokes,
+        {
+          paint: () => canvasRef.current?.exportBlob() ?? Promise.resolve(null),
+          mask: async () => {
+            const r = await canvasRef.current?.exportMaskBlob()
+            return r ?? null
+          },
+        },
+      )
+      toast(t('preprocessInpaint.toastSaved', { name: newName }), 'success')
       await refreshWorkspace()
-      if (res.name !== activeName) setActiveName(res.name)
+      if (newName !== activeName) setActiveName(newName)
       void reload()
     } catch (e) {
       toast(String(e), 'error')
     } finally {
       setBusy(false)
     }
-  }, [activeName, activeImage, project.id, vid, clearSaved, refreshWorkspace, reload, toast, t])
+  }, [
+    activeName, activeImage, activeHistory.length,
+    activePaintStrokes, activeMaskStrokes,
+    saveImageBoth, refreshWorkspace, reload, toast, t,
+  ])
 
   const saveAll = useCallback(async () => {
     const dirty = editedNames
@@ -246,13 +318,14 @@ export default function PreprocessInpaintPage() {
     try {
       for (const name of dirty) {
         const im = images.find((i) => i.name === name)
-        const strokes = strokesByImage[name] ?? []
-        if (!im || strokes.length === 0) continue
+        const hist = historyByImage[name] ?? []
+        if (!im || hist.length === 0) continue
         try {
-          // 统一走离屏重放（活动图也一样），不依赖显示 canvas 的挂载状态
-          const blob = await renderInpaintedBlob(rawUrl(im), im.w, im.h, strokes)
-          await api.saveInpaintTrain(project.id, vid, name, blob)
-          clearSaved(name)
+          await saveImageBoth(
+            im,
+            hist.filter((h) => h.kind === 'paint').map((h) => h.stroke),
+            hist.filter((h) => h.kind === 'mask').map((h) => h.stroke),
+          )
           ok++
         } catch {
           failed.push(name)
@@ -269,7 +342,10 @@ export default function PreprocessInpaintPage() {
     } finally {
       setBusy(false)
     }
-  }, [editedNames, images, strokesByImage, rawUrl, project.id, vid, clearSaved, refreshWorkspace, reload, toast, t])
+  }, [
+    editedNames, images, historyByImage, saveImageBoth,
+    refreshWorkspace, reload, toast, t,
+  ])
 
   // ────── Render ──────
   if (!activeVersion) {
@@ -287,8 +363,7 @@ export default function PreprocessInpaintPage() {
       subtitle={t('preprocessInpaint.subtitle')}
       actions={
         <>
-          {/* 次操作 = ghost / 主操作 = primary + icon（对齐裁剪页 header 范式）。
-              还原不放这页 —— 总览页是还原统一入口。 */}
+          {/* 保存 = 两个数据面的全部未保存改动；文案 / 可用性不随模式变 */}
           <button
             type="button"
             onClick={() => void saveAll()}
@@ -300,7 +375,7 @@ export default function PreprocessInpaintPage() {
           <button
             type="button"
             onClick={() => void saveActive()}
-            disabled={busy || activeStrokes.length === 0}
+            disabled={busy || activeHistory.length === 0}
             className="btn btn-primary btn-sm"
           >
             <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
@@ -339,7 +414,7 @@ export default function PreprocessInpaintPage() {
             <span className="flex-1" />
             <button
               onClick={undo}
-              disabled={!activeName || activeStrokes.length === 0}
+              disabled={!activeName || activeHistory.length === 0}
               className="btn btn-ghost btn-sm"
               title="Ctrl+Z"
             >↶ {t('preprocessInpaint.undo')}</button>
@@ -351,7 +426,7 @@ export default function PreprocessInpaintPage() {
             >↷ {t('preprocessInpaint.redo')}</button>
             <button
               onClick={clearActive}
-              disabled={!activeName || activeStrokes.length === 0}
+              disabled={!activeName || activeHistory.length === 0}
               className="btn btn-ghost btn-sm"
             >{t('preprocessInpaint.clearActive')}</button>
           </header>
@@ -370,7 +445,6 @@ export default function PreprocessInpaintPage() {
             )}
 
             {activeImage && (
-              /* 3-column layout（对齐裁剪页）— filmstrip / canvas / tool panel */
               <div
                 className="grid gap-3 h-full min-h-0"
                 style={{ gridTemplateColumns: '220px minmax(0, 1fr) 260px' }}
@@ -386,11 +460,18 @@ export default function PreprocessInpaintPage() {
                     ) + `&_=${im.mtime}`
                   }}
                   emptyHint={t(`preprocessInpaint.filmstripEmpty.${filter}`)}
-                  renderOverlay={(im) =>
-                    (strokesByImage[im.name] ?? []).length > 0 ? (
-                      <span className="fs-badge">✎</span>
-                    ) : null
-                  }
+                  renderOverlay={(im) => {
+                    const hist = historyByImage[im.name] ?? []
+                    const hasPaint = hist.some((h) => h.kind === 'paint')
+                    const hasMask = im.mask_mtime != null
+                      || hist.some((h) => h.kind === 'mask')
+                    if (!hasPaint && !hasMask) return null
+                    return (
+                      <span className="fs-badge">
+                        {hasPaint ? '✎' : ''}{hasMask ? 'M' : ''}
+                      </span>
+                    )
+                  }}
                 />
 
                 <div className="min-w-0 min-h-0 overflow-hidden">
@@ -400,14 +481,23 @@ export default function PreprocessInpaintPage() {
                     imageUrl={rawUrl(activeImage)}
                     imageW={activeImage.w}
                     imageH={activeImage.h}
-                    strokes={activeStrokes}
+                    mode={mode}
+                    strokes={activePaintStrokes}
+                    maskStrokes={activeMaskStrokes}
+                    maskBaseUrl={maskBaseUrlFor(activeImage)}
                     brush={brush}
+                    erase={erase}
                     onStrokeEnd={onStrokeEnd}
+                    onMaskStrokeEnd={onMaskStrokeEnd}
                     onPickColor={onPickColor}
                   />
                 </div>
 
                 <ToolPanel
+                  mode={mode}
+                  setMode={setMode}
+                  erase={erase}
+                  setErase={setErase}
                   brush={brush}
                   setBrush={setBrush}
                   recentColors={recentColors}
@@ -422,14 +512,54 @@ export default function PreprocessInpaintPage() {
 }
 
 // ---------------------------------------------------------------------------
-// Tool panel（right side）— PR-B 在顶部加「涂抹 | Mask」模式切换，布局不重排
+// Tool panel（right side）
 // ---------------------------------------------------------------------------
 
+/** 胶囊 radio（视觉对齐设置页更新通道的 vs-channel-radio：圆点 + 文字）。 */
+function RadioPill({
+  on, label, onClick,
+}: {
+  on: boolean
+  label: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      role="radio"
+      aria-checked={on}
+      onClick={onClick}
+      className={
+        'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs transition-colors ' +
+        (on
+          ? 'border-accent text-accent bg-accent-soft'
+          : 'border-dim text-fg-secondary bg-transparent hover:bg-overlay')
+      }
+    >
+      <span
+        className={
+          'w-[7px] h-[7px] rounded-full border border-current shrink-0 ' +
+          (on ? 'bg-current' : 'bg-transparent')
+        }
+      />
+      {label}
+    </button>
+  )
+}
+
 function ToolPanel({
+  mode,
+  setMode,
+  erase,
+  setErase,
   brush,
   setBrush,
   recentColors,
 }: {
+  mode: InpaintMode
+  setMode: (m: InpaintMode) => void
+  erase: boolean
+  setErase: (v: boolean) => void
   brush: BrushState
   setBrush: (v: BrushState | ((prev: BrushState) => BrushState)) => void
   recentColors: string[]
@@ -439,34 +569,61 @@ function ToolPanel({
   return (
     <div className="bg-sunken border border-subtle rounded-md flex flex-col h-full min-h-0 overflow-hidden">
       <div className="flex flex-col gap-2 p-2.5 flex-1 min-h-0 overflow-y-auto">
-        {/* 三行统一版式：label(w-10) + 主控件(flex-1) + 右侧控件(56px)。
-            色轮原生 picker 自带取色器 / RGB 输入；历史颜色 icon 点击下拉。 */}
-        <div className="flex items-center gap-1.5 text-xs">
-          <span className="text-fg-tertiary shrink-0 w-10">{t('preprocessInpaint.brushColor')}</span>
-          <input
-            type="color"
-            value={brush.color}
-            onChange={(e) => setBrush((p) => ({ ...p, color: e.target.value }))}
-            className="flex-1 min-w-0 h-7 p-0 border border-subtle rounded cursor-pointer bg-transparent"
-            title={t('preprocessInpaint.colorWheel')}
-          />
-          <button
-            type="button"
-            onClick={() => setRecentOpen((v) => !v)}
-            disabled={recentColors.length === 0}
-            className={
-              'btn btn-ghost btn-sm justify-center shrink-0 ' +
-              (recentOpen ? 'bg-overlay text-fg-primary' : '')
-            }
-            style={{ width: 56 }}
-            title={t('preprocessInpaint.recentColors')}
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6a7 7 0 1 1 7 7 6.98 6.98 0 0 1-4.9-2l-1.42 1.42A8.96 8.96 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z" />
-            </svg>
-          </button>
+        <h3 className="caption">{t('preprocessInpaint.panelTitle')}</h3>
+        {/* 模式 / 工具两行 radio（样式对齐设置页更新通道） */}
+        <div className="flex items-center gap-1.5 text-xs" role="radiogroup">
+          <span className="text-fg-tertiary shrink-0 w-10">{t('preprocessInpaint.modeLabel')}</span>
+          {(['paint', 'mask'] as const).map((m) => (
+            <RadioPill
+              key={m}
+              on={mode === m}
+              label={t(`preprocessInpaint.mode.${m}`)}
+              onClick={() => setMode(m)}
+            />
+          ))}
         </div>
-        {recentOpen && recentColors.length > 0 && (
+        <div className="flex items-center gap-1.5 text-xs" role="radiogroup">
+          <span className="text-fg-tertiary shrink-0 w-10">{t('preprocessInpaint.toolLabel')}</span>
+          <RadioPill
+            on={!erase}
+            label={t('preprocessInpaint.toolBrush')}
+            onClick={() => setErase(false)}
+          />
+          <RadioPill
+            on={erase}
+            label={t('preprocessInpaint.toolEraser')}
+            onClick={() => setErase(true)}
+          />
+        </div>
+
+        {mode === 'paint' && (
+          <div className="flex items-center gap-1.5 text-xs">
+            <span className="text-fg-tertiary shrink-0 w-10">{t('preprocessInpaint.brushColor')}</span>
+            <input
+              type="color"
+              value={brush.color}
+              onChange={(e) => setBrush((p) => ({ ...p, color: e.target.value }))}
+              className="flex-1 min-w-0 h-7 p-0 border border-subtle rounded cursor-pointer bg-transparent"
+              title={t('preprocessInpaint.colorWheel')}
+            />
+            <button
+              type="button"
+              onClick={() => setRecentOpen((v) => !v)}
+              disabled={recentColors.length === 0}
+              className={
+                'btn btn-ghost btn-sm justify-center shrink-0 ' +
+                (recentOpen ? 'bg-overlay text-fg-primary' : '')
+              }
+              style={{ width: 56 }}
+              title={t('preprocessInpaint.recentColors')}
+            >
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+                <path d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6a7 7 0 1 1 7 7 6.98 6.98 0 0 1-4.9-2l-1.42 1.42A8.96 8.96 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z" />
+              </svg>
+            </button>
+          </div>
+        )}
+        {mode === 'paint' && recentOpen && recentColors.length > 0 && (
           <div className="flex items-center gap-1 flex-wrap">
             {recentColors.map((c) => (
               <button

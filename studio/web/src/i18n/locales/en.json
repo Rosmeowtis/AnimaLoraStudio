@@ -1793,6 +1793,7 @@
     "exportBundleConfig": "Training config",
     "exportBundleConfigHint": "(hyperparams for this version, no path fields)",
     "exportBundleLatentCache": "Include VAE latent cache (.npz)",
+    "exportBundleTrainMasks": "Include training masks (inpaint Mask data)",
     "exportBundleDestinationHint": "The bundle will be generated now, then downloaded by your browser or saved to data_exports/.",
     "exportBundleDestination": "Export destination",
     "exportBundleDownload": "Download to local",
@@ -2028,6 +2029,15 @@
     "subtitle": "Upscale / crop / inpaint — Inpaint tool",
     "saveActive": "Save current image",
     "saveAll": "Save all ({{n}})",
+    "panelTitle": "Inpaint settings",
+    "modeLabel": "Mode",
+    "mode": {
+      "paint": "Paint",
+      "mask": "Mask"
+    },
+    "toolLabel": "Tool",
+    "toolBrush": "Brush",
+    "toolEraser": "Eraser",
     "clearActive": "Discard edits",
     "filter": {
       "all": "All",
