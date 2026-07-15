@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 class TrainingContext:
     # ─── bootstrap_phase 填充 ───
     args: Any  # argparse.Namespace
+    family: Any = None  # ModelFamily（多模型 PR-2b；resolve_family(args) 产物）
     config_path: Optional[Path] = None
     config_dir: Optional[Path] = None
     device: str = "cpu"
@@ -55,9 +56,9 @@ class TrainingContext:
     repo_root: Optional[Path] = None
     model: Any = None
     vae: Any = None
-    qwen_model: Any = None
-    qwen_tok: Any = None
-    t5_tok: Any = None
+    # 文本编码器持有物（family 私有结构，Anima=(qwen_model, qwen_tok, t5_tok)；
+    # 对循环 opaque —— 多模型 PR-2b D15，替代原 qwen_model/qwen_tok/t5_tok 三字段）
+    text_stack: Any = None
     injector: Any = None
 
     # ─── dataset_phase 填充 ───
@@ -79,7 +80,7 @@ class TrainingContext:
     scheduler: Any = None
     timestep_sampler: Any = None    # training.timestep_samplers.TimestepSamplerProtocol
     loss_fn: Optional["LossProtocol"] = None
-    sra_aligner: Any = None         # training.sra_align.SRAAligner (optional)
+    sra_aligner: Any = None         # training.families.anima.sra_align.SRAAligner (optional)
 
     # ─── resume_phase 填充 ───
     global_step: int = 0

@@ -1,7 +1,7 @@
 """模型加载基础设施：前缀推断、safetensors 读取、路径解析、xformers / 梯度检查点。
 
 抽自原 runtime/anima_train.py L370-612（ADR 0003 PR-A）。这里都是相对底层的 utils；
-更上层的 load_anima_model / load_vae / load_text_encoders 在 training.models。
+更上层的 load_vae 在 training.vae；load_anima_model / load_text_encoders 在 families/anima/loader。
 
 公开（被 sister script 用）：
 - find_diffusion_pipe_root / resolve_path_best_effort / enable_xformers
@@ -28,34 +28,6 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # 梯度检查点
 # ============================================================================
-
-def forward_with_optional_checkpoint(model, latents, timesteps, cross, padding_mask, use_checkpoint=False):
-    """带可选梯度检查点的前向传播。"""
-    if not use_checkpoint:
-        return model(latents, timesteps, cross, padding_mask=padding_mask)
-    from torch.utils.checkpoint import checkpoint
-
-    x_B_T_H_W_D, rope_emb, extra_pos_emb = model.prepare_embedded_sequence(
-        latents, fps=None, padding_mask=padding_mask,
-    )
-    if timesteps.ndim == 1:
-        timesteps = timesteps.unsqueeze(1)
-    t_embedding, adaln_lora = model.t_embedder(timesteps)
-    t_embedding = model.t_embedding_norm(t_embedding)
-
-    block_kwargs = {
-        "rope_emb_L_1_1_D": rope_emb,
-        "adaln_lora_B_T_3D": adaln_lora,
-        "extra_per_block_pos_emb": extra_pos_emb,
-    }
-
-    for block in model.blocks:
-        def custom_forward(x, blk=block):
-            return blk(x, t_embedding, cross, **block_kwargs)
-        x_B_T_H_W_D = checkpoint(custom_forward, x_B_T_H_W_D, use_reentrant=False)
-
-    x_B_T_H_W_O = model.final_layer(x_B_T_H_W_D, t_embedding, adaln_lora_B_T_3D=adaln_lora)
-    return model.unpatchify(x_B_T_H_W_O)
 
 
 # ============================================================================
@@ -197,6 +169,15 @@ def _load_safetensors_state_dict(path: Path) -> dict:
     return sd
 
 
+def ensure_models_namespace(repo_root):
+    """确保 models 命名空间可用。"""
+    repo_root = Path(repo_root)
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    if str(repo_root.parent) not in sys.path:
+        sys.path.insert(0, str(repo_root.parent))
+
+
 def resolve_path_best_effort(path_str: str, bases: list[Path]) -> str:
     """
     将相对路径按多个 base 尝试解析到一个真实存在的路径。
@@ -283,3 +264,7 @@ def _load_weights_best_effort(model: torch.nn.Module, sd: dict, label: str) -> d
         "missing": missing,
         "unexpected": unexpected,
     }
+
+
+# 兼容 re-export（sister/loop 现有 import 面；多模型 PR-2b 移居 families/anima/forward.py）
+from training.families.anima.forward import forward_with_optional_checkpoint  # noqa: E402,F401

@@ -10,12 +10,11 @@ from pathlib import Path
 
 from training.context import TrainingContext
 from training.families.anima import ANIMA_SPEC as _ANIMA_SPEC
+from training.families import resolve_family
 from training.model_loading import (
-    enable_xformers,
     find_diffusion_pipe_root,
     resolve_path_best_effort,
 )
-from training.models import load_anima_model, load_text_encoders, load_vae
 
 
 logger = logging.getLogger(__name__)
@@ -29,6 +28,8 @@ def run(ctx: TrainingContext) -> None:
     - 注入 LoRA + 可选 resume_lora
     """
     args = ctx.args
+    if ctx.family is None:
+        ctx.family = resolve_family(args)
 
     # 查找模型代码
     ctx.repo_root = find_diffusion_pipe_root()
@@ -58,30 +59,25 @@ def run(ctx: TrainingContext) -> None:
     if reg_data_dir:
         args.reg_data_dir = resolve_path_best_effort(reg_data_dir, bases)
 
-    # 按 attention_backend 决策：xformers / flash_attn / none。
-    # load_anima_model 内部按 flash_attn 参数设 flash_attn 全局开关；
-    # xformers 是 model 层面的额外注入（与 flash_attn 互斥）。
+    # 经 ModelFamily 派发（D8'）；attention backend 决策收进 family.load_dit
     backend = getattr(args, "attention_backend", "flash_attn")
-    use_flash = (backend == "flash_attn")
-
-    # 加载模型
-    logger.info("加载 Transformer...")
-    ctx.model = load_anima_model(
-        args.transformer_path, ctx.device, ctx.dtype, ctx.repo_root, flash_attn=use_flash,
-    )
-
-    if backend == "xformers":
-        enable_xformers(ctx.model)
-    elif backend == "none":
+    if backend == "none":
         logger.info("attention_backend=none，flash_attn / xformers 都不启用，走 PyTorch SDPA")
 
+    logger.info("加载 Transformer...")
+    ctx.model = ctx.family.load_dit(
+        args.transformer_path, ctx.device, ctx.dtype,
+        attention_backend=backend, repo_root=ctx.repo_root,
+    )
+
     logger.info("加载 VAE...")
-    ctx.vae = load_vae(args.vae_path, ctx.device, ctx.vae_dtype, ctx.repo_root,
-                       tiling=getattr(args, "vae_tiling", "auto"))
+    ctx.vae = ctx.family.load_vae(args.vae_path, ctx.device, ctx.vae_dtype,
+                                  tiling=getattr(args, "vae_tiling", "auto"))
 
     logger.info("加载文本编码器...")
-    ctx.qwen_model, ctx.qwen_tok, ctx.t5_tok = load_text_encoders(
-        args.text_encoder_path, args.t5_tokenizer_path, ctx.device, ctx.dtype,
+    ctx.text_stack = ctx.family.load_text(
+        args.text_encoder_path, ctx.device, ctx.dtype,
+        t5_tokenizer_path=args.t5_tokenizer_path,
     )
 
     # 注入 LoRA — PR-C 通过 adapters/ plugin registry 派发，加新变体见
@@ -89,16 +85,23 @@ def run(ctx: TrainingContext) -> None:
     logger.info(f"注入 {args.lora_type.upper()}...")
     from training.adapters import build_adapter
     ctx.injector = build_adapter(args)
+    ctx.injector.metadata_extra = ctx.family.lora_metadata()  # D13：产物族标记
     ctx.injector.inject(ctx.model)
 
-    # 从已有 LoRA 继续训练
+    # 从已有 LoRA 继续训练（D13：跨族 fail-fast；无标记存量产物 grandfather 为 anima）
     if getattr(args, "resume_lora", "") and Path(args.resume_lora).exists():
+        _lora_family = _read_lora_family(args.resume_lora)
+        if _lora_family != ctx.family.spec.family_id:
+            raise RuntimeError(
+                f"resume_lora 跨模型族被拒绝：{args.resume_lora} 属于 '{_lora_family}'，"
+                f"当前 model_family='{ctx.family.spec.family_id}'"
+            )
         ctx.injector.load(args.resume_lora)
         logger.info(f"将从已有 LoRA 继续训练: {args.resume_lora}")
 
     # SRA v2 表征对齐（LoRA 注入后构造）
     if getattr(args, "sra_enabled", False):
-        from training.sra_align import SRAAligner
+        from training.families.anima.sra_align import SRAAligner
         model_channels = ctx.model.model_channels
         block_idx = int(getattr(args, "sra_block", 4))
         num_blocks = len(ctx.model.blocks)
@@ -116,3 +119,18 @@ def run(ctx: TrainingContext) -> None:
             dtype=ctx.dtype,
             normalize=bool(getattr(args, "sra_normalize", True)),
         )
+
+
+def _read_lora_family(path) -> str:
+    """从 safetensors metadata 读产物所属族；无标记 grandfather 为 anima（D13）。"""
+    import json
+
+    from safetensors import safe_open
+
+    try:
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            meta = f.metadata() or {}
+        args = json.loads(meta.get("ss_network_args") or "{}")
+        return str(args.get("model_family") or "anima")
+    except Exception:
+        return "anima"
