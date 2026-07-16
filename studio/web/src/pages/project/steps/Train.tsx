@@ -28,6 +28,7 @@ import {
   defaultsFromSchema,
   generateUniquePresetName,
 } from '../../../lib/preset-helpers'
+import FamilySwitchDialog from '../../../components/FamilySwitchDialog'
 
 // 全局模型字段来自全局设置，对版本维度只读
 const GLOBAL_MODEL_FIELDS = [
@@ -97,6 +98,23 @@ export default function TrainPage() {
     configRef.current = v
     setConfig(v)
   }, [])
+
+  /** 待确认的族切换目标（非空时渲染 FamilySwitchDialog）。 */
+  const [familySwitchTarget, setFamilySwitchTarget] = useState<string | null>(null)
+
+  /** SchemaForm.onChange 入口：拦截 model_family 变化走切换动作（P4-3）。
+   * 切族不是裸字段编辑——弹结构化确认对话框（后端重算路径 + 重置族风味
+   * 字段），用户取消则保持旧值不动。其余字段变更原样透传 setConfigSync。 */
+  const onFormChange = useCallback((v: ConfigData) => {
+    const prev = configRef.current
+    const prevFamily = String(prev?.model_family ?? 'anima')
+    const nextFamily = String(v.model_family ?? 'anima')
+    if (prev && nextFamily !== prevFamily) {
+      setFamilySwitchTarget(nextFamily)
+      return
+    }
+    setConfigSync(v)
+  }, [setConfigSync])
 
   const vid = activeVersion?.id ?? null
 
@@ -776,13 +794,24 @@ export default function TrainPage() {
                 <SchemaForm
                   schema={schema}
                   values={config}
-                  onChange={setConfigSync}
+                  onChange={onFormChange}
                   disabledFields={disabledFields}
                   disabledHints={disabledHints}
                   autoHints={autoHints}
                   fieldSuffixes={makeResetSuffixes(config, setConfigSync)}
                   advancedMode={advancedMode}
                 />
+                {familySwitchTarget && config && (
+                  <FamilySwitchDialog
+                    target={familySwitchTarget}
+                    config={config}
+                    onApply={(switched) => {
+                      setConfigSync(switched)
+                      setFamilySwitchTarget(null)
+                    }}
+                    onCancel={() => setFamilySwitchTarget(null)}
+                  />
+                )}
               </section>
             ) : (
               <ConfigSkeleton label={t('train.loadingConfig')} />
