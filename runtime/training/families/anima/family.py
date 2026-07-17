@@ -18,7 +18,10 @@ class AnimaFamily:
 
     # ── 加载 ─────────────────────────────────────────────────────────────
     def load_dit(self, path, device, dtype, *,
-                 attention_backend: str = "flash_attn", repo_root=None):
+                 attention_backend: str = "flash_attn", repo_root=None,
+                 purpose: str = "train"):
+        # purpose 是量化推理旋钮（krea2 fp8）；Anima 无量化形态，接受并忽略
+        del purpose
         from training.families.anima.loader import load_anima_model
         from training.model_loading import enable_xformers
 
@@ -42,9 +45,12 @@ class AnimaFamily:
                   cache_enabled: bool = True):
         from training.families.anima.loader import load_text_encoders
 
+        # purpose 接受并忽略（load_dit 同款）：Anima 的 TE backend 只由调用方
+        # 显式 comfy_qwen 决定——generate 调用面传 purpose 不得覆盖用户选择的
+        # text_encoder_backend（默认 hf）。
         return load_text_encoders(
             text_encoder_path, t5_tokenizer_path, device, dtype,
-            comfy_qwen=(comfy_qwen or purpose == "generate"),
+            comfy_qwen=comfy_qwen,
             t5_fast=t5_fast,
         )
 

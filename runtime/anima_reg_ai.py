@@ -436,6 +436,7 @@ def main() -> None:
     model = family.load_dit(
         transformer_path, device, dtype,
         attention_backend=("flash_attn" if use_flash else "none"), repo_root=repo_root,
+        purpose="generate",
     )
     if use_xformers:
         _T.enable_xformers(model)
@@ -449,6 +450,7 @@ def main() -> None:
     text_stack = family.load_text(
         text_encoder_path, device, dtype,
         t5_tokenizer_path=t5_tokenizer_path or None,
+        purpose="generate",
         cache_enabled=False,
     )
 

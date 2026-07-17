@@ -18,6 +18,7 @@ import gc
 import logging
 from dataclasses import dataclass
 from pathlib import Path
+from types import MethodType
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import torch
@@ -103,6 +104,54 @@ def pad_text_conditions(
     return Krea2TextCondition(context=padded, attention_mask=mask)
 
 
+def _cast_linear_forward(self, input: Tensor) -> Tensor:
+    # ComfyUI manual_cast 语义（ops.py cast_bias_weight）：权重低精度常驻，
+    # 前向 cast 到 input.dtype 计算。fp16→fp32 cast 精确，逐层 cast 与
+    # 整模 upcast 数值逐位一致——显存差别（8.9GB vs 17.8GB）才是取舍点。
+    weight = self.weight.to(input.dtype)
+    bias = self.bias.to(input.dtype) if self.bias is not None else None
+    return torch.nn.functional.linear(input, weight, bias)
+
+
+def _cast_embedding_forward(self, input: Tensor) -> Tensor:
+    # comfy ops Embedding：weight cast 到 compute dtype 再 lookup（row-select
+    # 与 cast 可交换，数值等价）——由此激活流从源头进入 compute dtype 域。
+    return torch.nn.functional.embedding(
+        input,
+        self.weight.to(self._krea2_compute_dtype),
+        self.padding_idx,
+        self.max_norm,
+        self.norm_type,
+        self.scale_grad_by_freq,
+        self.sparse,
+    )
+
+
+def patch_manual_cast(model: torch.nn.Module, compute_dtype: torch.dtype) -> int:
+    """ComfyUI manual_cast 等价 patch（sd.py:258 ``set_model_compute_dtype``）。
+
+    Embedding 输出进入 compute dtype 域后，全部 Linear 逐层把低精度权重
+    cast 到 input.dtype（=compute dtype）计算；RMSNorm / rotary 无需 patch——
+    transformers 实现里 fp32 激活流叠 torch type promotion 与 Comfy 的
+    weight-cast 语义数值一致。返回 patch 的模块数。
+    """
+    patched = 0
+    for module in model.modules():
+        if isinstance(module, torch.nn.Linear):
+            module.forward = MethodType(_cast_linear_forward, module)
+            patched += 1
+        elif isinstance(module, torch.nn.Embedding):
+            module._krea2_compute_dtype = compute_dtype
+            module.forward = MethodType(_cast_embedding_forward, module)
+            patched += 1
+    if patched:
+        logger.info(
+            "Krea2 TE manual_cast：%d 个模块以 %s 计算（权重常驻存储 dtype）",
+            patched, compute_dtype,
+        )
+    return patched
+
+
 def _default_model_loader(
     model_path: Path,
     device: torch.device,
@@ -155,6 +204,7 @@ class Krea2TextStack:
         *,
         device: torch.device | str,
         dtype: torch.dtype = torch.bfloat16,
+        compute_dtype: torch.dtype | None = None,
         cache_enabled: bool = True,
         tokenizer=None,
         model_loader: Callable[[Path, torch.device, torch.dtype], Any] | None = None,
@@ -167,10 +217,14 @@ class Krea2TextStack:
         self.model_path = Path(model_path)
         self.device = torch.device(device)
         self.dtype = dtype
+        # None = compute 跟随存储 dtype（训练路径现状）；生成场景传 fp32 +
+        # dtype=fp16 复刻 ComfyUI「fp16 存储 + fp32 compute」口径（sd.py:258）
+        self.compute_dtype = compute_dtype
         self.cache_enabled = bool(cache_enabled)
         self.tokenizer = tokenizer if tokenizer is not None else _load_tokenizer(self.model_path)
         self._model_loader = model_loader or _default_model_loader
         self._model = None
+        self._offloaded = False
         self.store = TextCacheStore(text_fingerprint)
         self.max_length = int(max_length)
         self.selected_layers = tuple(int(index) for index in selected_layers)
@@ -192,7 +246,28 @@ class Krea2TextStack:
     def ensure_model(self):
         if self._model is None:
             self._model = self._model_loader(self.model_path, self.device, self.dtype)
+            if self.compute_dtype is not None and self.compute_dtype != self.dtype:
+                patch_manual_cast(self._model, self.compute_dtype)
+        elif self._offloaded:
+            # 上次采样前被 offload 到 CPU（见 offload_model）——搬回目标设备
+            self._model.to(self.device)
+            self._offloaded = False
         return self._model
+
+    def offload_model(self) -> None:
+        """把 TE 挪到 CPU 给 DiT 腾显存（Comfy parity：free_memory 的
+        「编码后卸载 CLIP 到 offload_device」语义）。
+
+        Generate 场景 DiT(26.3GB bf16) + Qwen3-VL(8.9GB) 同驻 ≈ 35GB，超出
+        32GB 支持下限——采样前必须让 DiT 独占。下个 prompt 由 ensure_model
+        搬回（GPU↔CPU 秒级，远快于 release 后从盘重载）。
+        """
+        if self._model is None or self._offloaded:
+            return
+        self._model.to("cpu")
+        self._offloaded = True
+        if self.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def release_model(self) -> None:
         """Release the cached-mode TE before the 12.9B DiT occupies the device."""
@@ -200,6 +275,7 @@ class Krea2TextStack:
         if self._model is None:
             return
         self._model = None
+        self._offloaded = False
         gc.collect()
         if self.device.type == "cuda" and torch.cuda.is_available():
             torch.cuda.empty_cache()
@@ -446,6 +522,7 @@ def load_krea2_text_stack(
     *,
     device: torch.device | str,
     dtype: torch.dtype = torch.bfloat16,
+    compute_dtype: torch.dtype | None = None,
     cache_enabled: bool = True,
 ) -> Krea2TextStack:
     """Create a lazy Krea2 text stack; only the small tokenizer loads immediately."""
@@ -454,5 +531,6 @@ def load_krea2_text_stack(
         model_path,
         device=device,
         dtype=dtype,
+        compute_dtype=compute_dtype,
         cache_enabled=cache_enabled,
     )

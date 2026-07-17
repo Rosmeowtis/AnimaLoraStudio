@@ -30,7 +30,7 @@ from training.families.latent_spaces import WAN21_F8C16
 from training.families.spec import (
     LoraOutputSpec,
     ModelSpec,
-    ResolutionAwareShift,
+    ConstantShift,
     SamplingDefaults,
     TextSpec,
 )
@@ -57,12 +57,11 @@ KREA2_SPEC = ModelSpec(
         default_scheduler=KREA2_SCHEDULER,
         default_steps=KREA2_RAW_STEPS,
         default_cfg=KREA2_RAW_GUIDANCE,
-        shift_policy=ResolutionAwareShift(
-            base_shift=KREA2_BASE_SHIFT,
-            max_shift=KREA2_MAX_SHIFT,
-            base_image_seq_len=KREA2_BASE_IMAGE_SEQ_LEN,
-            max_image_seq_len=KREA2_MAX_IMAGE_SEQ_LEN,
-        ),
+        # Comfy parity 口径：固定 mu=1.15（ComfyUI ModelSamplingFlux 同款；
+        # 注意本值是 **mu（exp 前）**，与 Anima ConstantShift 的直接因子语义
+        # 不同——shift_policy 语义归 family 解释）。diffusers 的分辨率感知
+        # 动态 mu 保留为 build_krea2_sigmas(dynamic_mu=True) 非默认路径。
+        shift_policy=ConstantShift(shift=1.15),
     ),
     capabilities=frozenset({"masked_loss", "text_cache"}),
     lora=LoraOutputSpec(prefix="lora_unet", preset_name="krea2_full"),
@@ -86,7 +85,8 @@ class Krea2Family:
     spec = KREA2_SPEC
 
     def load_dit(self, path, device, dtype, *,
-                 attention_backend: str = "flash_attn", repo_root=None):
+                 attention_backend: str = "flash_attn", repo_root=None,
+                 purpose: str = "train"):
         from training.families.krea2.loader import load_krea2_model
 
         if attention_backend != "none":
@@ -94,7 +94,7 @@ class Krea2Family:
                 "Krea2 当前固定使用 PyTorch SDPA；忽略 attention_backend=%s",
                 attention_backend,
             )
-        return load_krea2_model(path, device, dtype)
+        return load_krea2_model(path, device, dtype, purpose=purpose)
 
     def load_vae(self, path, device, dtype, *, tiling: str = "auto"):
         from training.vae import load_vae
@@ -105,6 +105,20 @@ class Krea2Family:
                   t5_tokenizer_path: str = "", comfy_qwen: bool = False,
                   t5_fast: bool = False, purpose: str = "train",
                   cache_enabled: bool = True):
+        if purpose == "generate":
+            import torch
+
+            # Comfy parity（sd.py:258）：生成场景 TE 固定 fp16 存储 + fp32
+            # compute（text_encoder_dtype 默认 fp16 + set_model_compute_dtype
+            # fp32），忽略调用方 dtype、无旋钮——与 TE offload 同款固定行为。
+            # 训练侧维持调用方 dtype（bf16）不动。
+            return load_krea2_text_stack(
+                text_encoder_path,
+                device=device,
+                dtype=torch.float16,
+                compute_dtype=torch.float32,
+                cache_enabled=cache_enabled,
+            )
         return load_krea2_text_stack(
             text_encoder_path,
             device=device,
@@ -168,6 +182,12 @@ class Krea2Family:
             dtype=dtype,
             phase_callback=phase_callback,
         )
+        # Comfy parity 编排：条件编码完成后把 TE 卸到 CPU，DiT 独占显存
+        # （free_memory 语义）。26.3GB DiT + 8.9GB TE 同驻超 32GB 支持下限。
+        # 下个 prompt 由 ensure_model 搬回；训练缓存模式 TE 本就已释放，no-op。
+        offload = getattr(text, "offload_model", None)
+        if callable(offload):
+            offload()
         return sample_image(
             model,
             vae,

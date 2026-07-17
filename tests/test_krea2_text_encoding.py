@@ -207,3 +207,77 @@ def test_cached_batch_miss_repairs_sidecar_after_prepare(tmp_path):
     assert entry.cache_path.is_file()
     assert not stack.is_model_loaded
     assert condition.attention_mask.sum().item() == 7
+
+
+def test_offload_model_round_trip():
+    """offload_model 把 TE 挪 CPU（DiT 独占显存）；ensure_model 搬回（Comfy
+    free_memory 语义）。未加载 / 重复调用安全 no-op。"""
+    import torch
+
+    from training.families.krea2.text_encoding import Krea2TextStack
+
+    class _FakeModel:
+        def __init__(self):
+            self.device_history = []
+
+        def to(self, device):
+            self.device_history.append(str(device))
+            return self
+
+    fake = _FakeModel()
+    stack = Krea2TextStack(
+        "unused-dir", device="cpu", cache_enabled=False,
+        tokenizer=object(), model_loader=lambda *a: fake,
+    )
+    stack.offload_model()          # 未加载 → no-op
+    assert fake.device_history == []
+    assert stack.ensure_model() is fake
+    stack.offload_model()
+    assert fake.device_history == ["cpu"]
+    stack.offload_model()          # 重复 → no-op
+    assert fake.device_history == ["cpu"]
+    assert stack.ensure_model() is fake   # 搬回 self.device
+    assert fake.device_history == ["cpu", "cpu"]
+
+
+def test_manual_cast_patch_fp16_storage_fp32_compute():
+    """manual_cast 等价 patch（ComfyUI sd.py:258 口径）：权重 fp16 常驻，
+    Embedding 输出与 Linear 计算都进 fp32 域；fp16→fp32 cast 精确，数值与
+    整模 upcast 逐位一致。"""
+
+    class _Tiny(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(8, 4)
+            self.proj = torch.nn.Linear(4, 4)
+
+    model = _Tiny().to(torch.float16)
+    stack = Krea2TextStack(
+        "unused-dir", device="cpu", dtype=torch.float16,
+        compute_dtype=torch.float32, cache_enabled=False,
+        tokenizer=object(), model_loader=lambda *a: model,
+    )
+
+    patched = stack.ensure_model()
+
+    embedded = patched.embed(torch.tensor([1, 3]))
+    out = patched.proj(embedded)
+    assert embedded.dtype == torch.float32
+    assert out.dtype == torch.float32
+    assert patched.embed.weight.dtype == torch.float16    # 存储不动
+    assert patched.proj.weight.dtype == torch.float16
+    expected = torch.nn.functional.linear(
+        embedded, model.proj.weight.float(), model.proj.bias.float(),
+    )
+    assert torch.equal(out, expected)
+
+
+def test_compute_dtype_none_leaves_model_unpatched():
+    """compute_dtype 缺省（训练路径现状）不 patch 任何模块。"""
+    model = torch.nn.Linear(2, 2)
+    stack = Krea2TextStack(
+        "unused-dir", device="cpu", dtype=torch.float32, cache_enabled=False,
+        tokenizer=object(), model_loader=lambda *a: model,
+    )
+    stack.ensure_model()
+    assert "forward" not in vars(model)
