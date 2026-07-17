@@ -474,6 +474,15 @@ class ModelCache:
             import gc
             gc.collect()
             if torch.cuda.is_available():
+                try:
+                    # cuBLAS workspace 是 C++ 级常驻分配（Python gc 不可见，
+                    # 仅 ~10MB），但会把所在 allocator segment 整段钉住——
+                    # 实测 fp8 采样后 8GB+ reserved 无法被 empty_cache 释放
+                    # （tmp/diag_vram_leak.py 复现）。ComfyUI soft_empty_cache
+                    # 同款处理；内部 API，失败可忽略（下轮加载会复用 cache）。
+                    torch._C._cuda_clearCublasWorkspaces()
+                except Exception:
+                    pass
                 torch.cuda.empty_cache()
         except Exception:
             pass
@@ -773,6 +782,7 @@ def _run_generate(
                     step_callback=preview_callback,
                     phase_callback=_phase_cb,
                     seed=seed,
+                    vram_policy=str(cfg.get("vram_policy") or "auto"),
                 )
                 CACHE._move_runtime_to_device()
                 fname = f"gen_{img_idx:04d}_p{pi}_c{ci}_s{seed}.png"
@@ -925,6 +935,7 @@ def _run_xy(
                     device=CACHE.device,
                     dtype=CACHE.dtype,
                     seed=cur_seed,
+                    vram_policy=str(cfg.get("vram_policy") or "auto"),
                 )
                 CACHE._move_runtime_to_device()
                 fname = f"xy_x{xi:02d}_y{yi:02d}_s{cur_seed}.png"
